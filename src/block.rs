@@ -11,7 +11,12 @@ pub type TokenId = u32;
 const TAG_NAMESPACE: u8 = 0x01;
 const TAG_BLOCK: u8 = 0x02;
 
-/// The name of a block: 128 bits of BLAKE3. 
+/// Tag, parent digest, token count.
+const HEADER_BYTES: usize = 1 + 16 + 8;
+/// Stack buffer for a block's hash preimage, enough for 128 tokens a block.
+const MAX_PREIMAGE: usize = HEADER_BYTES + 4 * 128;
+
+/// The name of a block: 128 bits of BLAKE3.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub struct BlockHash([u8; 16]);
 
@@ -167,7 +172,31 @@ impl PrefixHasher {
     }
 
     /// One link of the chain.
+    ///
+    /// Laid out into one buffer and hashed in a single call. BLAKE3's
+    /// incremental API costs ~180ns per block here against ~45ns one-shot,
+    /// almost all of it per-`update` overhead on inputs this small.
     pub fn child(&self, parent: BlockHash, tokens: &[TokenId]) -> BlockHash {
+        let payload = HEADER_BYTES + 4 * tokens.len();
+        if payload > MAX_PREIMAGE {
+            return self.child_streaming(parent, tokens);
+        }
+
+        let mut buffer = [0u8; MAX_PREIMAGE];
+        buffer[0] = TAG_BLOCK;
+        buffer[1..17].copy_from_slice(parent.as_bytes());
+        buffer[17..HEADER_BYTES].copy_from_slice(&(tokens.len() as u64).to_le_bytes());
+        let (slots, _) = buffer[HEADER_BYTES..payload].as_chunks_mut::<4>();
+        for (slot, token) in slots.iter_mut().zip(tokens) {
+            *slot = token.to_le_bytes();
+        }
+
+        truncate(blake3::hash(&buffer[..payload]))
+    }
+
+    /// Same byte stream, for block sizes too large to stage on the stack.
+    /// BLAKE3 is a streaming hash, so this produces identical digests.
+    fn child_streaming(&self, parent: BlockHash, tokens: &[TokenId]) -> BlockHash {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[TAG_BLOCK]);
         hasher.update(parent.as_bytes());
@@ -252,6 +281,23 @@ mod tests {
         let second = hasher.chain(&shifted);
 
         assert_ne!(first[0], second[1]);
+    }
+
+    #[test]
+    fn one_shot_and_streaming_agree() {
+        // The fallback path must be byte-identical to the fast path, or a
+        // large block size would silently create a second namespace.
+        let layout = BlockLayout::tiny();
+        let hasher = PrefixHasher::new("m", &layout);
+        let root = hasher.namespace();
+        for count in [1usize, 16, 128] {
+            let tokens: Vec<TokenId> = (0..count as TokenId).collect();
+            assert_eq!(
+                hasher.child(root, &tokens),
+                hasher.child_streaming(root, &tokens),
+                "mismatch at {count} tokens"
+            );
+        }
     }
 
     #[test]

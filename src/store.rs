@@ -118,17 +118,25 @@ impl KvStore {
     /// Name every full block of `tokens` and report how many are resident.
     pub fn lookup(&mut self, tokens: &[TokenId]) -> Lookup {
         let hashes = self.hasher.chain(tokens);
-        let matched = self.index.match_prefix(&hashes);
-
-        self.stats.lookups += 1;
-        self.stats.queried_blocks += hashes.len() as u64;
-        self.stats.hit_blocks += matched as u64;
+        let matched = self.match_prefix(&hashes);
 
         Lookup {
             hashes,
             matched,
             tokens_per_block: self.layout.tokens_per_block,
         }
+    }
+
+    /// Probe names computed elsewhere. Phase 2's wire carries hashes rather
+    /// than tokens, so a peer never has to ship us a whole prompt to ask.
+    pub fn match_prefix(&mut self, hashes: &[BlockHash]) -> usize {
+        let matched = self.index.match_prefix(hashes);
+
+        self.stats.lookups += 1;
+        self.stats.queried_blocks += hashes.len() as u64;
+        self.stats.hit_blocks += matched as u64;
+
+        matched
     }
 
     /// Borrow a resident block's bytes. Phase 2 writes this slice straight

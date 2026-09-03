@@ -9,3 +9,10 @@ memmap2 = "0.9"
 
 [profile.release]
 debug = true
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "lookup"
+harness = false
