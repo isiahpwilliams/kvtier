@@ -6,6 +6,10 @@
 //! lack: a block is useless without every block before it, since attention
 //! over token 5000 reads the KV of tokens 0..5000. So we insert only when the
 //! parent is resident, and remove only leaves.
+//!
+//! The pin count is the second reason a block may be unremovable: a reader
+//! sending its bytes to a socket holds a pin, and eviction must not pull the
+//! slab out from under an in-flight transfer.
 
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
@@ -48,6 +52,8 @@ pub struct Entry {
     /// Tokens covered from the start of the sequence through this block.
     /// Phase 3 prices recompute cost with it: prefill is superlinear in depth.
     pub depth_tokens: u32,
+    /// Readers currently holding this block's bytes.
+    pub pins: u32,
     /// Logical clock value at last hit.
     pub last_access: u64,
 }
@@ -59,6 +65,8 @@ pub enum IndexError {
     OrphanParent,
     /// Removing this block would strand its descendants.
     HasChildren,
+    /// A reader is holding this block's bytes.
+    Pinned,
     NotFound,
 }
 
@@ -124,6 +132,7 @@ impl Index {
                 parent,
                 children: 0,
                 depth_tokens,
+                pins: 0,
                 last_access: self.clock,
             },
         );
@@ -135,11 +144,35 @@ impl Index {
         Ok(())
     }
 
+    /// Hold a block open for reading, returning where its bytes are. The
+    /// block cannot be removed until the matching `unpin`.
+    pub fn pin(&mut self, hash: BlockHash) -> Option<SlotId> {
+        self.clock += 1;
+        let clock = self.clock;
+        let entry = self.entries.get_mut(&hash)?;
+        entry.pins += 1;
+        entry.last_access = clock;
+        Some(entry.slot)
+    }
+
+    pub fn unpin(&mut self, hash: BlockHash) {
+        match self.entries.get_mut(&hash) {
+            Some(entry) => {
+                debug_assert!(entry.pins > 0, "unpin of an unpinned block");
+                entry.pins = entry.pins.saturating_sub(1);
+            }
+            // Unreachable while pins block removal, but a lost pin would leak
+            // a slot forever, so this must not panic in release.
+            None => debug_assert!(false, "unpin of a block that is gone"),
+        }
+    }
+
     /// Remove a leaf, returning its entry so the caller can free the slot.
     pub fn remove(&mut self, hash: BlockHash) -> Result<Entry, IndexError> {
         match self.entries.get(&hash) {
             None => return Err(IndexError::NotFound),
             Some(entry) if entry.children > 0 => return Err(IndexError::HasChildren),
+            Some(entry) if entry.pins > 0 => return Err(IndexError::Pinned),
             Some(_) => {}
         }
 
@@ -165,11 +198,11 @@ impl Index {
         matched
     }
 
-    /// Resident leaves: the only blocks eligible for eviction.
+    /// Unpinned resident leaves: the only blocks eligible for eviction.
     pub fn leaves(&self) -> impl Iterator<Item = (BlockHash, &Entry)> {
         self.entries
             .iter()
-            .filter(|(_, e)| e.children == 0)
+            .filter(|(_, e)| e.children == 0 && e.pins == 0)
             .map(|(h, e)| (*h, e))
     }
 }
@@ -261,6 +294,36 @@ mod tests {
 
         let leaves: Vec<_> = index.leaves().map(|(h, _)| h).collect();
         assert_eq!(leaves, vec![hashes[2]]);
+    }
+
+    #[test]
+    fn a_pinned_block_cannot_be_removed() {
+        let mut index = Index::new();
+        let hashes = chain(1);
+        index.insert(hashes[0], None, slot(0), 16).unwrap();
+
+        index.pin(hashes[0]).unwrap();
+        assert_eq!(index.remove(hashes[0]), Err(IndexError::Pinned));
+        assert!(index.leaves().next().is_none(), "pinned is not evictable");
+
+        index.unpin(hashes[0]);
+        index.remove(hashes[0]).unwrap();
+    }
+
+    #[test]
+    fn pins_nest() {
+        let mut index = Index::new();
+        let hashes = chain(1);
+        index.insert(hashes[0], None, slot(0), 16).unwrap();
+
+        // Two readers on the same block; the first to finish must not free it.
+        index.pin(hashes[0]).unwrap();
+        index.pin(hashes[0]).unwrap();
+        index.unpin(hashes[0]);
+        assert_eq!(index.remove(hashes[0]), Err(IndexError::Pinned));
+
+        index.unpin(hashes[0]);
+        index.remove(hashes[0]).unwrap();
     }
 
     #[test]

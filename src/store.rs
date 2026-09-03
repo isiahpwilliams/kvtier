@@ -5,7 +5,7 @@ use std::io;
 
 use crate::block::{BlockHash, BlockLayout, PrefixHasher, TokenId};
 use crate::index::Index;
-use crate::slab::Slab;
+use crate::slab::{PinnedBlock, Slab};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -113,6 +113,11 @@ impl KvStore {
         self.stats
     }
 
+    /// Read-only view of the index, for eviction policy and tests.
+    pub fn index(&self) -> &Index {
+        &self.index
+    }
+
     pub fn resident_blocks(&self) -> usize {
         self.index.len()
     }
@@ -145,11 +150,38 @@ impl KvStore {
         matched
     }
 
-    /// Borrow a resident block's bytes. Phase 2 writes this slice straight
-    /// to a socket.
+    /// Borrow a resident block's bytes.
     pub fn read(&self, hash: BlockHash) -> Option<&[u8]> {
         let slot = self.index.get(hash)?.slot;
         Some(self.slab.block(slot))
+    }
+
+    /// Hold the resident leading run of `hashes` open for reading.
+    ///
+    /// The returned guards outlive this borrow, so the server can drop the
+    /// store lock and spend the whole socket write unlocked. Every guard must
+    /// come back to `unpin_all`, including on an error path -- a lost pin
+    /// makes its block permanently unevictable.
+    pub fn pin_run(&mut self, hashes: &[BlockHash]) -> Vec<PinnedBlock> {
+        let mut pinned = Vec::with_capacity(hashes.len());
+        for &hash in hashes {
+            match self.index.pin(hash) {
+                Some(slot) => pinned.push(self.slab.pinned(hash, slot)),
+                // A gap ends the run: nothing past it is usable anyway.
+                None => break,
+            }
+        }
+
+        self.stats.lookups += 1;
+        self.stats.queried_blocks += hashes.len() as u64;
+        self.stats.hit_blocks += pinned.len() as u64;
+        pinned
+    }
+
+    pub fn unpin_all(&mut self, blocks: &[PinnedBlock]) {
+        for block in blocks {
+            self.index.unpin(block.hash());
+        }
     }
 
     /// Admit one block. `parent` is the preceding block's name, or `None`

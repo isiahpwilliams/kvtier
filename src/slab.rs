@@ -2,14 +2,26 @@
 //! makes allocation a `Vec::pop` and freeing a `Vec::push`.
 //!
 //! An mmap rather than a `Vec<u8>` because the address range never moves
-//! (Phase 2 hands these addresses to vectored writes, Phase 4 to
-//! `cudaHostRegister`), pages commit lazily, and swapping `map_anon` for a
-//! file-backed mapping gives us the NVMe tier.
+//! (the server writes these addresses straight to a socket, Phase 4 hands
+//! them to `cudaHostRegister`), pages commit lazily, and swapping `map_anon`
+//! for a file-backed mapping gives us the NVMe tier.
+//!
+//! The mapping lives behind an `Arc` so a reader can hold on to one block
+//! while the allocator keeps handing out others. What makes that sound is a
+//! single invariant, enforced by `Slab` and `Index` together:
+//!
+//!   **A block is written once, before it is reachable, and never again.**
+//!
+//! `admit` writes a slot while it is still absent from the index, so no
+//! reader can name it. Once published, the bytes are immutable until the
+//! slot is freed, and a slot with pins outstanding cannot be freed.
 
 use std::io;
-use std::ops::Range;
+use std::sync::Arc;
 
 use memmap2::MmapMut;
+
+use crate::block::BlockHash;
 
 /// Index of a block-sized slot within the slab.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
@@ -26,10 +38,78 @@ impl SlotId {
     }
 }
 
-pub struct Slab {
-    memory: MmapMut,
+/// The mapping itself, with no notion of which slots are in use.
+pub struct SlabMemory {
+    base: *mut u8,
     block_bytes: usize,
     capacity: usize,
+    /// Keeps the mapping alive. The base address is captured once and stays
+    /// valid regardless of where this struct is moved.
+    _map: MmapMut,
+}
+
+// SAFETY: the raw pointer is a stable mmap base. Callers of `block` and
+// `block_mut` uphold disjointness; see their safety contracts.
+unsafe impl Send for SlabMemory {}
+unsafe impl Sync for SlabMemory {}
+
+impl SlabMemory {
+    fn new(block_bytes: usize, capacity: usize) -> io::Result<Self> {
+        let mut map = MmapMut::map_anon(block_bytes * capacity)?;
+        Ok(Self {
+            base: map.as_mut_ptr(),
+            block_bytes,
+            capacity,
+            _map: map,
+        })
+    }
+
+    fn offset(&self, slot: SlotId) -> *mut u8 {
+        debug_assert!(slot.index() < self.capacity, "slot out of range");
+        // SAFETY: the slot index is within capacity, so the result is inside
+        // the mapping.
+        unsafe { self.base.add(slot.index() * self.block_bytes) }
+    }
+
+    /// # Safety
+    /// `slot` must be allocated, and no `&mut` to it may exist while the
+    /// returned slice lives.
+    unsafe fn block(&self, slot: SlotId) -> &[u8] {
+        unsafe { std::slice::from_raw_parts(self.offset(slot), self.block_bytes) }
+    }
+
+    /// # Safety
+    /// `slot` must be allocated and not yet reachable by any reader, and no
+    /// other reference to it may exist.
+    #[allow(clippy::mut_from_ref)]
+    unsafe fn block_mut(&self, slot: SlotId) -> &mut [u8] {
+        unsafe { std::slice::from_raw_parts_mut(self.offset(slot), self.block_bytes) }
+    }
+}
+
+/// A block held open for reading. Its slot cannot be freed or rewritten
+/// while this exists, so the bytes stay valid without holding the store lock.
+pub struct PinnedBlock {
+    memory: Arc<SlabMemory>,
+    hash: BlockHash,
+    slot: SlotId,
+}
+
+impl PinnedBlock {
+    pub fn hash(&self) -> BlockHash {
+        self.hash
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        // SAFETY: this block's index entry holds a pin, so its slot is not in
+        // the free list and cannot be handed to `admit`. A published block is
+        // never written again, so no `&mut` to it can exist.
+        unsafe { self.memory.block(self.slot) }
+    }
+}
+
+pub struct Slab {
+    memory: Arc<SlabMemory>,
     /// Free slots, LIFO: the last-freed slot is still cache-hot.
     free: Vec<u32>,
     live: usize,
@@ -44,14 +124,10 @@ impl Slab {
             "capacity exceeds SlotId range"
         );
 
-        let memory = MmapMut::map_anon(block_bytes * capacity)?;
         // Reversed so the first allocations hand out slot 0, 1, 2, ...
         let free = (0..capacity as u32).rev().collect();
-
         Ok(Self {
-            memory,
-            block_bytes,
-            capacity,
+            memory: Arc::new(SlabMemory::new(block_bytes, capacity)?),
             free,
             live: 0,
         })
@@ -66,32 +142,41 @@ impl Slab {
     }
 
     pub fn free(&mut self, slot: SlotId) {
-        debug_assert!(slot.index() < self.capacity, "slot out of range");
+        debug_assert!(slot.index() < self.memory.capacity, "slot out of range");
         debug_assert!(!self.free.contains(&slot.0), "double free of {slot:?}");
         self.free.push(slot.0);
         self.live -= 1;
     }
 
-    fn range(&self, slot: SlotId) -> Range<usize> {
-        let start = slot.index() * self.block_bytes;
-        start..start + self.block_bytes
-    }
-
     pub fn block(&self, slot: SlotId) -> &[u8] {
-        &self.memory[self.range(slot)]
+        // SAFETY: `&self` rules out a concurrent `block_mut`, which needs
+        // `&mut self`.
+        unsafe { self.memory.block(slot) }
     }
 
     pub fn block_mut(&mut self, slot: SlotId) -> &mut [u8] {
-        let range = self.range(slot);
-        &mut self.memory[range]
+        // SAFETY: `&mut self` rules out every other reference through this
+        // `Slab`. Callers must not have published the slot yet, or a
+        // `PinnedBlock` could be reading it.
+        unsafe { self.memory.block_mut(slot) }
+    }
+
+    /// Hold a slot open for reading past the lifetime of a `&self` borrow.
+    /// The caller must have pinned `hash` in the index first.
+    pub fn pinned(&self, hash: BlockHash, slot: SlotId) -> PinnedBlock {
+        PinnedBlock {
+            memory: Arc::clone(&self.memory),
+            hash,
+            slot,
+        }
     }
 
     pub fn block_bytes(&self) -> usize {
-        self.block_bytes
+        self.memory.block_bytes
     }
 
     pub fn capacity(&self) -> usize {
-        self.capacity
+        self.memory.capacity
     }
 
     /// Slots currently handed out.
@@ -105,11 +190,11 @@ impl Slab {
 
     /// Reserved address space, not resident memory.
     pub fn reserved_bytes(&self) -> usize {
-        self.block_bytes * self.capacity
+        self.block_bytes() * self.capacity()
     }
 
     pub fn utilization(&self) -> f64 {
-        self.live as f64 / self.capacity as f64
+        self.live as f64 / self.capacity() as f64
     }
 }
 
@@ -161,5 +246,21 @@ mod tests {
         let slot = slab.alloc().unwrap();
         slab.block_mut(slot)[..4].copy_from_slice(&[1, 2, 3, 4]);
         assert_eq!(&slab.block(slot)[..4], &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn a_pinned_block_outlives_the_borrow_and_ignores_other_writes() {
+        let mut slab = Slab::new(64, 4).unwrap();
+        let held = slab.alloc().unwrap();
+        slab.block_mut(held).fill(0x11);
+
+        let pinned = slab.pinned(BlockHash::from_bytes([0; 16]), held);
+
+        // Writing other slots must not disturb the pinned one.
+        for _ in 0..3 {
+            let other = slab.alloc().unwrap();
+            slab.block_mut(other).fill(0x22);
+        }
+        assert!(pinned.bytes().iter().all(|&x| x == 0x11));
     }
 }

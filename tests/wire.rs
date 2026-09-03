@@ -288,3 +288,86 @@ async fn a_run_longer_than_one_frame_is_split_transparently() {
         );
     }
 }
+
+#[tokio::test]
+async fn concurrent_fetches_each_get_their_own_bytes() {
+    // The point of pinning: transfers overlap, and none of them sees another
+    // client's block.
+    let (addr, _store) = start(512).await;
+
+    let mut writer = KvClient::connect(addr).await.unwrap();
+    let mut sequences = Vec::new();
+    for seed in 0..8u64 {
+        let (names, payloads) = sequence(&tokens(64, 200 + seed));
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        writer.put_blocks(None, &names, &refs).await.unwrap();
+        sequences.push((
+            names.iter().map(|&(hash, _)| hash).collect::<Vec<_>>(),
+            payloads,
+        ));
+    }
+
+    let mut tasks = Vec::new();
+    for (hashes, payloads) in sequences {
+        tasks.push(tokio::spawn(async move {
+            let mut client = KvClient::connect(addr).await.unwrap();
+            for _ in 0..8 {
+                assert_eq!(client.get_blocks(&hashes).await.unwrap(), payloads);
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn admits_proceed_while_a_fetch_is_in_flight() {
+    // A reader holds pins, not the store lock, so writers are not blocked and
+    // the reader's bytes are unaffected by what lands meanwhile.
+    let (addr, store) = start(512).await;
+
+    let mut writer = KvClient::connect(addr).await.unwrap();
+    let (names, payloads) = sequence(&tokens(64, 300));
+    let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    writer.put_blocks(None, &names, &refs).await.unwrap();
+    let hashes: Vec<BlockHash> = names.iter().map(|&(hash, _)| hash).collect();
+
+    let reader = tokio::spawn(async move {
+        let mut client = KvClient::connect(addr).await.unwrap();
+        for _ in 0..32 {
+            assert_eq!(client.get_blocks(&hashes).await.unwrap(), payloads);
+        }
+    });
+
+    for seed in 0..32u64 {
+        let (names, payloads) = sequence(&tokens(32, 400 + seed));
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        writer.put_blocks(None, &names, &refs).await.unwrap();
+    }
+    reader.await.unwrap();
+
+    assert!(store.lock().await.resident_blocks() > 4, "admits landed");
+}
+
+#[tokio::test]
+async fn pins_are_released_after_a_fetch() {
+    let (addr, store) = start(64).await;
+    let mut client = KvClient::connect(addr).await.unwrap();
+
+    let (names, payloads) = sequence(&tokens(64, 500));
+    let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+    client.put_blocks(None, &names, &refs).await.unwrap();
+
+    let hashes: Vec<BlockHash> = names.iter().map(|&(hash, _)| hash).collect();
+    client.get_blocks(&hashes).await.unwrap();
+
+    // A leaked pin would leave the block unevictable forever, which shows up
+    // as an empty eviction candidate list.
+    let store = store.lock().await;
+    assert_eq!(
+        store.index().leaves().count(),
+        1,
+        "the tail block must be evictable again once the transfer is done"
+    );
+}

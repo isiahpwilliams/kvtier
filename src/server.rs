@@ -18,6 +18,7 @@ use crate::proto::{
     HEADER_BYTES, Header, Opcode, ProtoError, Reader, ServerInfo, Writer, blocks_per_frame,
     encode_info,
 };
+use crate::slab::PinnedBlock;
 use crate::store::KvStore;
 
 pub struct Server {
@@ -134,6 +135,9 @@ async fn handle_match_prefix(
 /// Returns the resident *leading run*, not whichever names happen to be
 /// present: a block past a gap is unusable, so sending it wastes bandwidth.
 /// Truncated to one frame, which the client just asks past.
+///
+/// The store lock is held only long enough to pin the run. The write itself
+/// runs unlocked, so a large transfer no longer blocks other clients.
 async fn handle_get_blocks(
     socket: &mut TcpStream,
     store: &Mutex<KvStore>,
@@ -141,27 +145,41 @@ async fn handle_get_blocks(
     payload: &[u8],
 ) -> io::Result<()> {
     let hashes = read_hash_request(payload)?;
-    let store = store.lock().await;
 
-    let block_bytes = store.layout().block_bytes();
-    let capacity = blocks_per_frame(block_bytes);
-    let mut available = 0;
-    while available < hashes.len().min(capacity) && store.read(hashes[available]).is_some() {
-        available += 1;
-    }
+    let (pinned, block_bytes) = {
+        let mut store = store.lock().await;
+        let block_bytes = store.layout().block_bytes();
+        let capacity = blocks_per_frame(block_bytes).min(hashes.len());
+        (store.pin_run(&hashes[..capacity]), block_bytes)
+    };
 
+    let result = write_blocks(socket, header, &pinned, block_bytes).await;
+
+    // Unconditional: a pin dropped on an error path would make its block
+    // unevictable for the life of the process.
+    store.lock().await.unpin_all(&pinned);
+    result
+}
+
+async fn write_blocks(
+    socket: &mut TcpStream,
+    header: Header,
+    pinned: &[PinnedBlock],
+    block_bytes: usize,
+) -> io::Result<()> {
     let response = Header::new(
         Opcode::GetBlocks,
         header.request_id,
-        4 + available * block_bytes,
+        4 + pinned.len() * block_bytes,
     );
     socket.write_all(&response.encode()).await?;
-    socket.write_all(&(available as u32).to_be_bytes()).await?;
+    socket
+        .write_all(&(pinned.len() as u32).to_be_bytes())
+        .await?;
 
     // Straight from the slab to the socket. No staging buffer exists.
-    for &hash in &hashes[..available] {
-        let block = store.read(hash).expect("counted as resident above");
-        socket.write_all(block).await?;
+    for block in pinned {
+        socket.write_all(block.bytes()).await?;
     }
     Ok(())
 }

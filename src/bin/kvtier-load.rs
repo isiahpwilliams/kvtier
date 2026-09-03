@@ -13,7 +13,7 @@ use kvtier::trace::SplitMix64;
 use tokio::sync::Mutex;
 
 const BLOCKS_PER_REQUEST: [usize; 4] = [1, 8, 32, 128];
-const ROUNDS: usize = 20;
+const ROUNDS: usize = 60;
 
 #[tokio::main]
 async fn main() -> std::io::Result<()> {
@@ -90,5 +90,58 @@ async fn main() -> std::io::Result<()> {
         start.elapsed().as_micros() as f64 / 1000.0
     );
 
+    concurrency_sweep(addr, &hashes[..8], block_bytes).await?;
+    Ok(())
+}
+
+/// Aggregate throughput as clients pile on. Flat means they are serializing
+/// on something; the store lock held across the socket write is the suspect.
+async fn concurrency_sweep(
+    addr: SocketAddr,
+    request: &[BlockHash],
+    block_bytes: usize,
+) -> std::io::Result<()> {
+    const ROUNDS: usize = 50;
+
+    println!("\n{:>8}  {:>12}  {:>12}", "clients", "GB/s", "ms/client");
+    for clients in [1usize, 2, 4, 8] {
+        let mut tasks = Vec::new();
+        for _ in 0..clients {
+            let request = request.to_vec();
+            tasks.push(tokio::spawn(async move {
+                let mut client = KvClient::connect(addr).await.unwrap();
+                // Connect outside the timed region as far as we can: the
+                // barrier below is what actually lines the clients up.
+                client.get_blocks(&request).await.unwrap();
+                client
+            }));
+        }
+        let mut ready = Vec::new();
+        for task in tasks {
+            ready.push(task.await.unwrap());
+        }
+
+        let start = Instant::now();
+        let mut running = Vec::new();
+        for mut client in ready {
+            let request = request.to_vec();
+            running.push(tokio::spawn(async move {
+                for _ in 0..ROUNDS {
+                    client.get_blocks(&request).await.unwrap();
+                }
+            }));
+        }
+        for task in running {
+            task.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        let total = (clients * ROUNDS * request.len() * block_bytes) as f64;
+        println!(
+            "{clients:>8}  {:>12.2}  {:>12.1}",
+            total / elapsed.as_secs_f64() / 1e9,
+            elapsed.as_millis() as f64
+        );
+    }
     Ok(())
 }
