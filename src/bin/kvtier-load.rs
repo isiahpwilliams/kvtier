@@ -1,8 +1,5 @@
-//! Load generator: how fast can we actually move KV over the wire?
-//!
-//! The number to beat is the rate the GPU regenerates KV. For Llama-3-8B
-//! that is roughly 0.6-3 GB/s depending on the accelerator, so anything
-//! slower than that means recomputing would have been cheaper.
+//! Load generator. The number to beat is the rate the GPU regenerates KV --
+//! roughly 0.6-3 GB/s for Llama-3-8B, below which recompute is cheaper.
 
 use std::net::SocketAddr;
 use std::sync::Arc;

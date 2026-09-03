@@ -1,13 +1,9 @@
 //! TCP server over a `KvStore`.
 //!
-//! The read path never copies a block. `GetBlocks` writes the response header
-//! and then each block's slab bytes straight to the socket, so a 2 MiB block
-//! goes mmap -> kernel with no staging buffer in between.
-//!
-//! The cost of that is a store lock held across the write: the slice is
-//! borrowed from the slab, and nothing may evict it mid-flight. That
-//! serializes clients for the duration of a transfer. Releasing the lock
-//! needs per-block pinning, which is the next step.
+//! `GetBlocks` writes block bytes from the slab straight to the socket, with
+//! no staging buffer. The slice is borrowed from the slab, so the store lock
+//! is held across the write and clients serialize for its duration --
+//! per-block pinning is what lifts that.
 
 use std::io;
 use std::net::SocketAddr;
@@ -135,13 +131,9 @@ async fn handle_match_prefix(
     respond(socket, header, &writer.finish()).await
 }
 
-/// Returns the resident *leading run* of the requested names, not whichever
-/// ones happen to be present. A block past a gap is unusable, so sending it
-/// would burn bandwidth on bytes the engine must throw away.
-///
-/// The run is also truncated to what fits in one frame. A short reply is
-/// indistinguishable from a gap to the protocol, and the client simply asks
-/// for the remainder -- so the frame cap costs a round trip, never bytes.
+/// Returns the resident *leading run*, not whichever names happen to be
+/// present: a block past a gap is unusable, so sending it wastes bandwidth.
+/// Truncated to one frame, which the client just asks past.
 async fn handle_get_blocks(
     socket: &mut TcpStream,
     store: &Mutex<KvStore>,

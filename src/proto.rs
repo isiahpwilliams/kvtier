@@ -24,11 +24,9 @@ pub const MAX_BLOCKS_PER_REQUEST: usize = 256;
 
 pub const HASH_BYTES: usize = 16;
 
-/// How many blocks fit in one frame at a given block size.
-///
-/// The block cap alone is not enough: 256 blocks is 512 KiB of tiny blocks
-/// but 512 MiB of Llama-3-8B blocks. Sized against `PutBlocks`, the heaviest
-/// message, so the answer is safe for every opcode.
+/// How many blocks fit in one frame. A count cap alone is useless when 256
+/// blocks means 512 KiB at one block size and 512 MiB at another. Sized
+/// against `PutBlocks`, the heaviest message, so it holds for every opcode.
 pub fn blocks_per_frame(block_bytes: usize) -> usize {
     /// Parent flag, parent hash, block count.
     const PRELUDE: usize = 1 + HASH_BYTES + 4;
@@ -41,8 +39,8 @@ pub fn blocks_per_frame(block_bytes: usize) -> usize {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[repr(u8)]
 pub enum Opcode {
-    /// Model id and block layout. A client must agree with these before its
-    /// block names mean anything here.
+    /// Model id and block layout, which a client must match for its block
+    /// names to mean anything here.
     Info = 1,
     /// Hashes in, count of resident leading blocks out.
     MatchPrefix = 2,
@@ -162,7 +160,7 @@ impl Header {
     }
 }
 
-/// What the server is: which model and block shape its names refer to.
+/// Which model and block shape a server's names refer to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerInfo {
     pub model_id: String,

@@ -72,12 +72,10 @@ impl KvClient {
         Ok(matched)
     }
 
-    /// Fetch the resident leading run of `hashes`. The result may be shorter
-    /// than the request, and never has gaps.
-    ///
-    /// A run longer than one frame is fetched over several round trips. The
-    /// server returns what fits and we ask for the rest, which is safe
-    /// because the run is always contiguous from the start of the request.
+    /// Fetch the resident leading run of `hashes`: possibly shorter than the
+    /// request, never gapped. A run past one frame takes several round trips,
+    /// which is safe because the run always starts at the request's first
+    /// hash.
     pub async fn get_blocks(&mut self, hashes: &[BlockHash]) -> io::Result<Vec<Vec<u8>>> {
         let per_frame = blocks_per_frame(self.block_bytes());
         let mut blocks = Vec::new();
@@ -116,11 +114,8 @@ impl KvClient {
     }
 
     /// Offer blocks to the server. `parent` is what the first one attaches
-    /// to; `None` starts a sequence.
-    ///
-    /// Split across frames when needed. Each chunk names the previous
-    /// chunk's last block as its parent, so the chain stays connected and a
-    /// chunk that fails to land stops the ones behind it.
+    /// to; `None` starts a sequence. Split across frames when needed, each
+    /// chunk parented on the last block of the one before it.
     pub async fn put_blocks(
         &mut self,
         parent: Option<BlockHash>,
