@@ -79,6 +79,7 @@ pub struct AdmitReport {
 }
 
 pub struct KvStore {
+    model_id: String,
     layout: BlockLayout,
     hasher: PrefixHasher,
     slab: Slab,
@@ -91,12 +92,17 @@ impl KvStore {
         let hasher = PrefixHasher::new(model_id, &layout);
         let slab = Slab::new(layout.block_bytes(), capacity_blocks)?;
         Ok(Self {
+            model_id: model_id.to_owned(),
             layout,
             hasher,
             slab,
             index: Index::new(),
             stats: Stats::default(),
         })
+    }
+
+    pub fn model_id(&self) -> &str {
+        &self.model_id
     }
 
     pub fn layout(&self) -> &BlockLayout {
@@ -198,12 +204,33 @@ impl KvStore {
             hashes.len()
         );
 
-        let mut report = AdmitReport::default();
-        for (i, data) in blocks.iter().enumerate() {
-            let parent = if i == 0 { None } else { Some(hashes[i - 1]) };
-            let depth = ((i + 1) * self.layout.tokens_per_block) as u32;
+        let names: Vec<(BlockHash, u32)> = hashes
+            .iter()
+            .take(blocks.len())
+            .enumerate()
+            .map(|(i, &hash)| (hash, ((i + 1) * self.layout.tokens_per_block) as u32))
+            .collect();
 
-            match self.admit(hashes[i], parent, depth, data) {
+        self.admit_chain(None, &names, blocks)
+    }
+
+    /// Admit a run of blocks named elsewhere. `parent` is what the first
+    /// block attaches to; after that each block's parent is the one before
+    /// it. This is the wire's admit path -- a peer sends names and bytes,
+    /// never tokens.
+    pub fn admit_chain(
+        &mut self,
+        parent: Option<BlockHash>,
+        names: &[(BlockHash, u32)],
+        blocks: &[&[u8]],
+    ) -> AdmitReport {
+        assert_eq!(names.len(), blocks.len(), "one name per payload");
+
+        let mut report = AdmitReport::default();
+        let mut parent = parent;
+
+        for (i, ((hash, depth), data)) in names.iter().zip(blocks).enumerate() {
+            match self.admit(*hash, parent, *depth, data) {
                 Admit::Inserted => report.inserted += 1,
                 Admit::AlreadyPresent => report.deduped += 1,
                 // Everything after a failure is an orphan.
@@ -212,6 +239,7 @@ impl KvStore {
                     break;
                 }
             }
+            parent = Some(*hash);
         }
         report
     }

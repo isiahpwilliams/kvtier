@@ -5,7 +5,10 @@
 //! we already computed?".
 
 pub mod block;
+pub mod client;
 pub mod index;
+pub mod proto;
+pub mod server;
 pub mod slab;
 pub mod store;
 pub mod trace;
