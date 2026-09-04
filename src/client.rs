@@ -189,6 +189,7 @@ impl KvClient {
             inserted_blocks: reader.u64()?,
             deduped_blocks: reader.u64()?,
             rejected_blocks: reader.u64()?,
+            evicted_blocks: reader.u64()?,
             bytes_admitted: reader.u64()?,
         };
         let resident = reader.u64()? as usize;

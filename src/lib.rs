@@ -6,6 +6,7 @@
 
 pub mod block;
 pub mod client;
+pub mod evict;
 pub mod index;
 pub mod proto;
 pub mod server;

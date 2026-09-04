@@ -42,7 +42,7 @@ impl Hasher for IdentityHasher {
 
 type BlockMap<V> = HashMap<BlockHash, V, BuildHasherDefault<IdentityHasher>>;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Entry {
     pub slot: SlotId,
     /// `None` for a sequence's first block: its parent is the unstored root.
@@ -56,6 +56,9 @@ pub struct Entry {
     pub pins: u32,
     /// Logical clock value at last hit.
     pub last_access: u64,
+    /// Eviction priority, owned by `evict`. Stored here so a candidate popped
+    /// from the policy's heap can be checked against the block's live value.
+    pub priority: f64,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -134,6 +137,7 @@ impl Index {
                 depth_tokens,
                 pins: 0,
                 last_access: self.clock,
+                priority: 0.0,
             },
         );
 
@@ -153,6 +157,12 @@ impl Index {
         entry.pins += 1;
         entry.last_access = clock;
         Some(entry.slot)
+    }
+
+    pub fn set_priority(&mut self, hash: BlockHash, priority: f64) {
+        if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.priority = priority;
+        }
     }
 
     pub fn unpin(&mut self, hash: BlockHash) {

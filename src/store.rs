@@ -4,6 +4,7 @@
 use std::io;
 
 use crate::block::{BlockHash, BlockLayout, PrefixHasher, TokenId};
+use crate::evict::{CostModel, GreedyDual};
 use crate::index::Index;
 use crate::slab::{PinnedBlock, Slab};
 
@@ -18,8 +19,9 @@ pub struct Stats {
     /// Admits that found the block already present: each one is a prefill
     /// some other request had already paid for.
     pub deduped_blocks: u64,
-    /// Admits refused because the slab was full.
+    /// Admits refused: the slab was full and nothing was worth displacing.
     pub rejected_blocks: u64,
+    pub evicted_blocks: u64,
     pub bytes_admitted: u64,
 }
 
@@ -63,7 +65,7 @@ pub enum Admit {
     Inserted,
     /// Some other sequence already computed this block.
     AlreadyPresent,
-    /// The slab is full. Phase 3 turns this into an eviction decision.
+    /// Full, and every resident block is pinned or has children.
     OutOfSpace,
     /// The preceding block is not resident, so this one is unusable.
     OrphanParent,
@@ -84,6 +86,7 @@ pub struct KvStore {
     hasher: PrefixHasher,
     slab: Slab,
     index: Index,
+    policy: GreedyDual,
     stats: Stats,
 }
 
@@ -97,8 +100,15 @@ impl KvStore {
             hasher,
             slab,
             index: Index::new(),
+            policy: GreedyDual::default(),
             stats: Stats::default(),
         })
+    }
+
+    /// Replace the recompute cost model, which is per-model.
+    pub fn with_cost_model(mut self, cost: CostModel) -> Self {
+        self.policy = GreedyDual::new(cost);
+        self
     }
 
     pub fn model_id(&self) -> &str {
@@ -113,9 +123,15 @@ impl KvStore {
         self.stats
     }
 
-    /// Read-only view of the index, for eviction policy and tests.
+    /// Read-only view of the index, for tests and inspection.
     pub fn index(&self) -> &Index {
         &self.index
+    }
+
+    /// Blocks the policy is currently tracking as eviction candidates,
+    /// including stale entries awaiting compaction.
+    pub fn eviction_candidates(&self) -> usize {
+        self.policy.candidates()
     }
 
     pub fn resident_blocks(&self) -> usize {
@@ -142,12 +158,34 @@ impl KvStore {
     /// than tokens, so a peer never has to ship us a whole prompt to ask.
     pub fn match_prefix(&mut self, hashes: &[BlockHash]) -> usize {
         let matched = self.index.match_prefix(hashes);
+        for &hash in &hashes[..matched] {
+            self.reprice(hash);
+        }
 
         self.stats.lookups += 1;
         self.stats.queried_blocks += hashes.len() as u64;
         self.stats.hit_blocks += matched as u64;
 
         matched
+    }
+
+    /// Raise a block's eviction priority to reflect having just been used,
+    /// and re-offer it to the policy at its new value.
+    fn reprice(&mut self, hash: BlockHash) {
+        let Some(depth) = self.index.get(hash).map(|entry| entry.depth_tokens) else {
+            return;
+        };
+        let priority = self.policy.priority_for(depth);
+        self.index.set_priority(hash, priority);
+
+        // Only leaves are ever eviction candidates, so offering an internal
+        // block would just add a heap entry that always gets skipped.
+        if self.index.get(hash).is_some_and(|e| e.children == 0) {
+            self.policy.offer(hash, priority);
+            if self.policy.should_compact(self.index.len()) {
+                self.policy.compact(&self.index);
+            }
+        }
     }
 
     /// Borrow a resident block's bytes.
@@ -166,7 +204,10 @@ impl KvStore {
         let mut pinned = Vec::with_capacity(hashes.len());
         for &hash in hashes {
             match self.index.pin(hash) {
-                Some(slot) => pinned.push(self.slab.pinned(hash, slot)),
+                Some(slot) => {
+                    pinned.push(self.slab.pinned(hash, slot));
+                    self.reprice(hash);
+                }
                 // A gap ends the run: nothing past it is usable anyway.
                 None => break,
             }
@@ -210,19 +251,65 @@ impl KvStore {
         }
 
         // Allocate after the checks so a rejected admit has nothing to undo.
-        let Some(slot) = self.slab.alloc() else {
-            self.stats.rejected_blocks += 1;
-            return Admit::OutOfSpace;
+        let slot = match self.slab.alloc() {
+            Some(slot) => slot,
+            None => match self.make_room(parent) {
+                Ok(()) => self.slab.alloc().expect("eviction freed a slot"),
+                Err(refusal) => {
+                    self.stats.rejected_blocks += 1;
+                    return refusal;
+                }
+            },
         };
 
         self.slab.block_mut(slot).copy_from_slice(data);
         self.index
             .insert(hash, parent, slot, depth_tokens)
             .expect("residency and duplication were checked above");
+        self.reprice(hash);
 
         self.stats.inserted_blocks += 1;
         self.stats.bytes_admitted += data.len() as u64;
         Admit::Inserted
+    }
+
+    /// Free one slot for a block of this depth, or say why we would not.
+    ///
+    /// `parent` is excluded from selection. It is a leaf until the block we
+    /// are admitting lands, which makes it the most attractive victim in the
+    /// store -- and evicting it would orphan the very block we came to insert.
+    fn make_room(&mut self, parent: Option<BlockHash>) -> Result<(), Admit> {
+        let Some((victim, priority)) = self.policy.select_victim(&self.index, parent) else {
+            return Err(Admit::OutOfSpace);
+        };
+
+        // Always admit once a victim exists, even when the newcomer models as
+        // cheaper. Refusing on that basis ossifies the cache: a new block
+        // starts shallow, so it always loses to the deep tails already
+        // resident, and nothing new is ever admitted -- which also means
+        // nothing is ever evicted, so the inflation clock never rises to
+        // break the tie. Letting it in at `L + cost` is what keeps the clock
+        // moving, and a block that is never used again leaves on the next
+        // pass anyway.
+        self.evict(victim, priority);
+        Ok(())
+    }
+
+    fn evict(&mut self, victim: BlockHash, priority: f64) {
+        let entry = self
+            .index
+            .remove(victim)
+            .expect("the policy only offers removable blocks");
+        self.slab.free(entry.slot);
+        self.policy.note_eviction(priority);
+        self.stats.evicted_blocks += 1;
+
+        // The parent may have just become a leaf, which makes it a candidate.
+        if let Some(parent) = entry.parent
+            && self.index.get(parent).is_some_and(|e| e.children == 0)
+        {
+            self.reprice(parent);
+        }
     }
 
     /// Admit the KV a request just computed: `blocks[i]` is the payload for
