@@ -23,6 +23,8 @@ that ever serializes differently misses instead of returning wrong bytes.
 from __future__ import annotations
 
 import os
+import queue
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -100,6 +102,82 @@ class _ReqState:
     offered_blocks: int = 0
 
 
+class _Saver:
+    """Writes blocks to the tier off the forward pass.
+
+    The GPU read stays on the caller's thread, inside the forward context
+    where the paged blocks are still valid, and only the socket write is
+    deferred. `wait_for_save` therefore still means what vLLM needs it to
+    mean -- nothing touches the paged buffer once it returns -- while the
+    wire, which is the expensive half, leaves the critical path.
+
+    One worker thread, deliberately. Puts have to land in chain order: a
+    block is only admitted under a resident parent, so a second thread could
+    orphan a chain it happened to overtake.
+    """
+
+    def __init__(self, address: str, slab_bytes: int, slabs: int):
+        # Its own connection. The Rust client is a single in-order stream and
+        # takes &mut self, so it cannot be shared with the load path.
+        self._client = kvtier.Client(address)
+        self._slabs = []
+        self._free: queue.Queue[int] = queue.Queue()
+        for index in range(slabs):
+            slab = torch.empty(slab_bytes, dtype=torch.uint8)
+            page_lock(slab)
+            self._slabs.append(slab)
+            self._free.put(index)
+
+        self._jobs: queue.Queue = queue.Queue()
+        self._inflight: set[bytes] = set()
+        self._lock = threading.Lock()
+        self.stored = 0
+        self.dropped = 0
+        self._thread = threading.Thread(
+            target=self._run, name="kvtier-save", daemon=True
+        )
+        self._thread.start()
+
+    def acquire(self):
+        """A free slab, blocking if every one is still in flight."""
+        index = self._free.get()
+        return index, self._slabs[index]
+
+    def submit(self, index: int, parent, names) -> None:
+        with self._lock:
+            self._inflight.update(name for name, _ in names)
+        self._jobs.put((index, parent, names))
+
+    def holds(self, name: bytes) -> bool:
+        """Queued but not yet admitted, so worth treating as already stored."""
+        with self._lock:
+            return name in self._inflight
+
+    def _run(self) -> None:
+        while True:
+            job = self._jobs.get()
+            if job is None:
+                return
+            index, parent, names = job
+            try:
+                inserted, _, dropped = self._client.put_from(
+                    parent, names, self._slabs[index].numpy()
+                )
+                self.stored += inserted
+                self.dropped += dropped
+            except Exception:
+                # A failed save is a future cache miss, never a wrong answer.
+                logger.exception("kvtier: a background save failed")
+            finally:
+                with self._lock:
+                    self._inflight.difference_update(name for name, _ in names)
+                self._free.put(index)
+
+    def close(self) -> None:
+        self._jobs.put(None)
+        self._thread.join(timeout=30)
+
+
 class KvtierConnector(KVConnectorBase_V1):
     def __init__(
         self,
@@ -134,6 +212,7 @@ class KvtierConnector(KVConnectorBase_V1):
         address = self._kv_transfer_config.get_from_extra_config(
             "kvtier_address", os.environ.get("KVTIER_ADDR", "127.0.0.1:7431")
         )
+        self._address = address
         self._client = kvtier.Client(address)
         self._hasher = self._client.hasher(tp_rank=self._tp_rank, tp_size=self._tp_size)
 
@@ -164,9 +243,20 @@ class KvtierConnector(KVConnectorBase_V1):
         self._slab_blocks = int(
             self._kv_transfer_config.get_from_extra_config("kvtier_slab_blocks", 256)
         )
+        self._save_slabs = int(
+            self._kv_transfer_config.get_from_extra_config("kvtier_save_slabs", 2)
+        )
+        self._async_saves = bool(
+            int(self._kv_transfer_config.get_from_extra_config("kvtier_async_saves", 1))
+        )
         self._slab = torch.empty(0, dtype=torch.uint8)
         self._slab_locked = False
+        self._saver: "_Saver | None" = None
         self._verify = bool(int(os.environ.get("KVTIER_VERIFY", "0")))
+        # Benchmark control: stay installed, serve nothing, store nothing.
+        # Separates "the tier moved KV" from "a connector was present", which
+        # otherwise both change with the same flag.
+        self._inert = bool(int(os.environ.get("KVTIER_INERT", "0")))
 
         self._reqs: dict[str, _ReqState] = {}
         self._pending_loads: list[LoadSpec] = []
@@ -213,18 +303,26 @@ class KvtierConnector(KVConnectorBase_V1):
         self._make_slab()
         logger.info(
             "kvtier registered %d layers, %d elements per (layer, block), "
-            "%d-block slab%s",
+            "%d-block slab%s, saves %s",
             len(views),
             self._elems_per_block,
             self._slab_blocks,
             " (page-locked)" if self._slab_locked else " (NOT page-locked)",
+            f"async over {self._save_slabs} slabs" if self._saver else "synchronous",
         )
 
     def _make_slab(self) -> None:
-        """One reusable host staging buffer, page-locked so copies are DMA."""
+        """Host staging, page-locked so copies are DMA.
+
+        The load path owns one slab and reuses it immediately. The save path
+        needs its own, and more than one, because a slab stays busy until its
+        write reaches the tier.
+        """
         nbytes = self._slab_blocks * self._client.block_bytes
         self._slab = torch.empty(nbytes, dtype=torch.uint8)
         self._slab_locked = page_lock(self._slab)
+        if self._async_saves:
+            self._saver = _Saver(self._address, nbytes, self._save_slabs)
         if not self._slab_locked:
             logger.warning(
                 "kvtier could not page-lock its %d B slab; host copies will "
@@ -232,11 +330,11 @@ class KvtierConnector(KVConnectorBase_V1):
                 nbytes,
             )
 
-    def _staged(self, blocks: int) -> torch.Tensor:
-        """The first `blocks` blocks of the slab, shaped (block, layer, elem)."""
+    def _staged(self, slab: torch.Tensor, blocks: int) -> torch.Tensor:
+        """The first `blocks` blocks of `slab`, shaped (block, layer, elem)."""
         span = blocks * self._client.block_bytes
         return (
-            self._slab[:span]
+            slab[:span]
             .view(self._kv_dtype)
             .view(blocks, len(self._blocks_view), self._elems_per_block)
         )
@@ -253,7 +351,7 @@ class KvtierConnector(KVConnectorBase_V1):
             names = spec.names[done : done + self._slab_blocks]
             got = self._client.fetch_into(names, self._slab.numpy())
             if got:
-                staged = self._staged(got)
+                staged = self._staged(self._slab, got)
                 ids = torch.tensor(
                     spec.block_ids[done : done + got], device=self._device
                 )
@@ -285,12 +383,12 @@ class KvtierConnector(KVConnectorBase_V1):
     ) -> None:
         return  # a kvtier block spans every layer, so saving happens once, below
 
-    def _verify_save(self, spec, at, stop, ids):
+    def _verify_save(self, spec, at, stop, ids, slab):
         """Debug: the slab must equal what is actually in the paged buffer."""
         gathered = torch.stack(
             [v.index_select(0, ids) for v in self._blocks_view], dim=1
         ).cpu()
-        if not torch.equal(gathered, self._staged(stop - at)):
+        if not torch.equal(gathered, self._staged(slab, stop - at)):
             logger.error(
                 "kvtier VERIFY save MISMATCH: %s blocks %d..%d", spec.req_id, at, stop
             )
@@ -305,7 +403,7 @@ class KvtierConnector(KVConnectorBase_V1):
         gathered = torch.stack(
             [v.index_select(0, ids) for v in self._blocks_view], dim=1
         ).cpu()
-        staged = self._staged(got)
+        staged = self._staged(self._slab, got)
         if not torch.equal(gathered, staged):
             wrong = (gathered != staged).flatten(1).any(dim=1).nonzero().flatten()
             logger.error(
@@ -329,6 +427,12 @@ class KvtierConnector(KVConnectorBase_V1):
         # looked. A block is only admitted under a resident parent, so ask
         # again and restart the run wherever the chain still ends.
         held = self._client.match_prefix(spec.names)
+        # Blocks already queued count as held: the worker drains in order, so
+        # they will be admitted before anything parented on them.
+        while self._saver is not None and held < len(spec.names):
+            if not self._saver.holds(spec.names[held]):
+                break
+            held += 1
         if held >= len(spec.names):
             return
         parent = spec.names[held - 1] if held else None
@@ -336,8 +440,13 @@ class KvtierConnector(KVConnectorBase_V1):
         at = held
         while at < len(spec.names):
             stop = min(at + self._slab_blocks, len(spec.names))
+            if self._saver is not None:
+                index, slab = self._saver.acquire()
+            else:
+                index, slab = None, self._slab
+
             ids = torch.tensor(spec.block_ids[at:stop], device=self._device)
-            staged = self._staged(stop - at)
+            staged = self._staged(slab, stop - at)
             # Gather every layer on the GPU first, so the way back is a single
             # contiguous device-to-host copy into page-locked memory.
             gathered = torch.stack(
@@ -345,16 +454,27 @@ class KvtierConnector(KVConnectorBase_V1):
             )
             staged.copy_(gathered)
             torch.cuda.current_stream(self._device).synchronize()
+            if self._verify:
+                self._verify_save(spec, at, stop, ids, slab)
 
             names = [(spec.names[i], spec.depths[i]) for i in range(at, stop)]
-            if self._verify:
-                self._verify_save(spec, at, stop, ids)
-            _, _, dropped = self._client.put_from(parent, names, self._slab.numpy())
-            if dropped:
-                logger.debug("kvtier dropped %d blocks for %s", dropped, spec.req_id)
-                return
+            if self._saver is not None:
+                # The paged buffer has been read; the rest is host memory.
+                self._saver.submit(index, parent, names)
+            else:
+                _, _, dropped = self._client.put_from(parent, names, slab.numpy())
+                if dropped:
+                    logger.debug(
+                        "kvtier dropped %d blocks for %s", dropped, spec.req_id
+                    )
+                    return
             parent = spec.names[stop - 1]
             at = stop
+
+    def shutdown(self):
+        if self._saver is not None:
+            self._saver.close()
+            self._saver = None
 
     # ==============================
     # Scheduler side
@@ -364,7 +484,7 @@ class KvtierConnector(KVConnectorBase_V1):
         self, request: "Request", num_computed_tokens: int
     ) -> tuple[int | None, bool]:
         prompt = request.prompt_token_ids
-        if not prompt:
+        if not prompt or self._inert:
             return 0, False
 
         names = self._hasher.chain(prompt)
@@ -455,7 +575,7 @@ class KvtierConnector(KVConnectorBase_V1):
     ) -> SaveSpec | None:
         """Blocks that become full during this step and are not in the tier yet."""
         state = self._reqs.get(req_id)
-        if state is None:
+        if state is None or self._inert:
             return None
         if block_ids is not None:
             state.block_ids = list(block_ids)

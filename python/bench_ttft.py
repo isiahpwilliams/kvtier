@@ -67,6 +67,7 @@ def make_engine(args, use_tier, addr):
             kv_connector_extra_config={
                 "kvtier_address": addr,
                 "kvtier_slab_blocks": args.slab_blocks,
+                "kvtier_async_saves": 0 if args.sync_saves else 1,
             },
         )
     return LLM(
@@ -155,6 +156,10 @@ def main():
     parser.add_argument("--gpu-fraction", type=float, default=0.90)
     parser.add_argument("--slab-blocks", type=int, default=256)
     parser.add_argument("--no-prefix-cache", action="store_true")
+    parser.add_argument(
+        "--sync-saves", action="store_true",
+        help="write blocks on the forward pass, the way it worked before",
+    )
     args = parser.parse_args()
 
     records = run_arm(args, args.arm == "tier", args.addr)
