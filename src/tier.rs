@@ -96,6 +96,22 @@ impl DiskReader {
     }
 }
 
+/// A write handle on the tier's file, detachable from the store, so
+/// writeback can run with the lock released.
+#[derive(Clone)]
+pub struct DiskWriter {
+    file: Arc<File>,
+    block_bytes: usize,
+}
+
+impl DiskWriter {
+    pub fn write(&self, slot: DiskSlot, data: &[u8]) -> io::Result<()> {
+        assert_eq!(data.len(), self.block_bytes, "payload must be one block");
+        self.file
+            .write_all_at(data, (slot.index() * self.block_bytes) as u64)
+    }
+}
+
 pub struct DiskTier {
     file: Arc<File>,
     path: PathBuf,
@@ -205,6 +221,19 @@ impl DiskTier {
         // a benchmark switch should.
         #[cfg(not(target_os = "macos"))]
         false
+    }
+
+    pub fn writer(&self) -> DiskWriter {
+        DiskWriter {
+            file: Arc::clone(&self.file),
+            block_bytes: self.block_bytes,
+        }
+    }
+
+    /// Account for writes issued through a detached `DiskWriter`.
+    pub fn note_writes(&mut self, count: u64, bytes: u64) {
+        self.stats.writes += count;
+        self.stats.bytes_written += bytes;
     }
 
     pub fn reader(&self) -> DiskReader {

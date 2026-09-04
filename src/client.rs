@@ -191,6 +191,8 @@ impl KvClient {
             rejected_blocks: reader.u64()?,
             evicted_blocks: reader.u64()?,
             demoted_blocks: reader.u64()?,
+            blocking_demotions: reader.u64()?,
+            written_back: reader.u64()?,
             promoted_blocks: reader.u64()?,
             bytes_admitted: reader.u64()?,
         };

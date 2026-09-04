@@ -7,7 +7,7 @@ use crate::block::{BlockHash, BlockLayout, PrefixHasher, TokenId};
 use crate::evict::{CostModel, GreedyDual};
 use crate::index::{Index, Place};
 use crate::slab::{BlockWriter, PinnedBlock, Slab, SlotId};
-use crate::tier::{DiskReader, DiskSlot, DiskStats, DiskTier, TierCosts};
+use crate::tier::{DiskReader, DiskSlot, DiskStats, DiskTier, DiskWriter, TierCosts};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -26,6 +26,11 @@ pub struct Stats {
     pub evicted_blocks: u64,
     /// Blocks pushed from RAM to disk rather than dropped.
     pub demoted_blocks: u64,
+    /// Demotions that had to write to disk with the store lock held. The
+    /// number writeback exists to drive to zero.
+    pub blocking_demotions: u64,
+    /// Blocks copied to disk ahead of time by the writeback loop.
+    pub written_back: u64,
     /// Blocks read back from disk on a hit.
     pub promoted_blocks: u64,
     pub bytes_admitted: u64,
@@ -70,6 +75,26 @@ impl Lookup {
 pub enum FetchPart {
     Ready(PinnedBlock),
     Pending(Promotion),
+}
+
+/// A dirty RAM block with a disk slot reserved for its copy.
+pub struct Writeback {
+    hash: BlockHash,
+    slot: SlotId,
+    disk_slot: DiskSlot,
+    block: PinnedBlock,
+    written: bool,
+}
+
+impl Writeback {
+    /// Copy the block to disk. Safe with the store lock released: the block
+    /// is pinned so it cannot move, and published blocks are immutable, so
+    /// the bytes cannot change under the write.
+    pub fn flush(&mut self, writer: &DiskWriter) -> std::io::Result<()> {
+        writer.write(self.disk_slot, self.block.bytes())?;
+        self.written = true;
+        Ok(())
+    }
 }
 
 /// A demoted block with a RAM slot reserved for it, waiting to be filled.
@@ -201,6 +226,11 @@ impl KvStore {
         self.ram_policy.candidates() + self.disk_policy.candidates()
     }
 
+    /// Slots in the RAM tier, whether or not they are in use.
+    pub fn ram_capacity(&self) -> usize {
+        self.slab.capacity()
+    }
+
     pub fn resident_blocks(&self) -> usize {
         self.index.len()
     }
@@ -324,7 +354,9 @@ impl KvStore {
             self.reprice(hash);
 
             match place {
-                Place::Ram(slot) => parts.push(FetchPart::Ready(self.slab.pinned(hash, slot))),
+                Place::Ram { slot, .. } => {
+                    parts.push(FetchPart::Ready(self.slab.pinned(hash, slot)))
+                }
                 Place::Disk(disk_slot) => {
                     // The pin above keeps this block off both eviction heaps
                     // while we are reading it.
@@ -397,10 +429,15 @@ impl KvStore {
     /// A filled promotion becomes the block's new home.
     fn publish(&mut self, promotion: Promotion) -> PinnedBlock {
         let slot = promotion.writer.slot();
-        self.index.set_place(promotion.hash, Place::Ram(slot));
-        if let Some(disk) = self.disk.as_mut() {
-            disk.free(promotion.disk_slot);
-        }
+        // Keep the disk copy: the block is instantly clean, so if it gets
+        // pushed back out there is nothing to write.
+        self.index.set_place(
+            promotion.hash,
+            Place::Ram {
+                slot,
+                backing: Some(promotion.disk_slot),
+            },
+        );
         self.reprice(promotion.hash);
         self.slab.pinned(promotion.hash, slot)
     }
@@ -413,6 +450,95 @@ impl KvStore {
 
     pub fn disk_reader(&self) -> Option<DiskReader> {
         self.disk.as_ref().map(DiskTier::reader)
+    }
+
+    pub fn disk_writer(&self) -> Option<DiskWriter> {
+        self.disk.as_ref().map(DiskTier::writer)
+    }
+
+    /// RAM blocks with no disk copy, whose slots cannot be reclaimed without
+    /// a write first.
+    pub fn dirty_blocks(&self) -> usize {
+        self.index
+            .iter()
+            .filter(|(_, entry)| entry.place.is_dirty())
+            .count()
+    }
+
+    /// Pick up to `max` dirty blocks to copy to disk, cheapest-to-keep first.
+    ///
+    /// Takes the blocks the eviction policy would give up next, so the work
+    /// lands exactly where it will be needed. Each job holds a pin and a
+    /// reserved disk slot; pass them all to `finish_writeback` or both leak.
+    pub fn begin_writeback(&mut self, max: usize) -> Vec<Writeback> {
+        if self.disk.is_none() || max == 0 {
+            return Vec::new();
+        }
+
+        let candidates = self
+            .ram_policy
+            .peek_victims(&self.index, max, |entry| entry.place.is_dirty());
+
+        let mut jobs = Vec::new();
+        for hash in candidates {
+            let Some(entry) = self.index.get(hash).copied() else {
+                continue;
+            };
+            // A block we would rather drop than demote is not worth a write.
+            if !self.worth_demoting(entry.depth_tokens) {
+                continue;
+            }
+            let Some(disk_slot) = self.disk.as_mut().and_then(DiskTier::alloc) else {
+                break; // disk is full; the blocking path can still make room
+            };
+            let Some(slot) = self.index.pin(hash).and_then(Place::ram) else {
+                self.disk.as_mut().expect("checked above").free(disk_slot);
+                continue;
+            };
+
+            jobs.push(Writeback {
+                hash,
+                slot,
+                disk_slot,
+                block: self.slab.pinned(hash, slot),
+                written: false,
+            });
+        }
+        jobs
+    }
+
+    /// Record the copies that landed, making those blocks free to evict.
+    pub fn finish_writeback(&mut self, jobs: Vec<Writeback>) {
+        let mut written = 0u64;
+        let mut bytes = 0u64;
+
+        for job in jobs {
+            if job.written {
+                // Only if it is still where we left it: a concurrent demotion
+                // may have moved it while the write was in flight.
+                if self.index.get(job.hash).is_some_and(|e| e.place.is_dirty()) {
+                    self.index.set_place(
+                        job.hash,
+                        Place::Ram {
+                            slot: job.slot,
+                            backing: Some(job.disk_slot),
+                        },
+                    );
+                    written += 1;
+                    bytes += self.layout.block_bytes() as u64;
+                } else if let Some(disk) = self.disk.as_mut() {
+                    disk.free(job.disk_slot);
+                }
+            } else if let Some(disk) = self.disk.as_mut() {
+                disk.free(job.disk_slot);
+            }
+            self.index.unpin(job.hash);
+        }
+
+        if let Some(disk) = self.disk.as_mut() {
+            disk.note_writes(written, bytes);
+        }
+        self.stats.written_back += written;
     }
 
     pub fn unpin_all(&mut self, blocks: &[PinnedBlock]) {
@@ -460,7 +586,7 @@ impl KvStore {
 
         self.slab.block_mut(slot).copy_from_slice(data);
         self.index
-            .insert(hash, parent, Place::Ram(slot), depth_tokens)
+            .insert(hash, parent, Place::dirty(slot), depth_tokens)
             .expect("residency and duplication were checked above");
         self.reprice(hash);
 
@@ -489,9 +615,22 @@ impl KvStore {
             };
             let entry = *self.index.get(victim).expect("selected from the index");
 
-            // Demotion beats dropping whenever a read back is cheaper than a
-            // rebuild, and unlike dropping it works on any block: a demoted
-            // parent is still there for its children.
+            // A clean block costs nothing to give up: its bytes are already
+            // on disk, so we just drop the RAM slot.
+            if let Place::Ram {
+                slot,
+                backing: Some(backing),
+            } = entry.place
+            {
+                self.release_clean(victim, slot, backing);
+                self.ram_policy.note_eviction(priority);
+                return Ok(());
+            }
+
+            // Otherwise pay for the write here. Demotion beats dropping
+            // whenever a read back is cheaper than a rebuild, and unlike
+            // dropping it works on any block: a demoted parent is still
+            // there for its children.
             if self.worth_demoting(entry.depth_tokens) && self.demote(victim).is_ok() {
                 self.ram_policy.note_eviction(priority);
                 return Ok(());
@@ -531,8 +670,18 @@ impl KvStore {
         self.slab.free(slot);
         self.index.set_place(hash, Place::Disk(disk_slot));
         self.stats.demoted_blocks += 1;
+        self.stats.blocking_demotions += 1;
         self.reprice(hash);
         Ok(())
+    }
+
+    /// Reclaim a clean block's RAM slot. Its bytes are already on disk, so
+    /// this is bookkeeping, not I/O -- which is the whole point of writeback.
+    fn release_clean(&mut self, hash: BlockHash, slot: SlotId, backing: DiskSlot) {
+        self.slab.free(slot);
+        self.index.set_place(hash, Place::Disk(backing));
+        self.stats.demoted_blocks += 1;
+        self.reprice(hash);
     }
 
     /// Read a block back into RAM so its bytes can be borrowed.
@@ -559,9 +708,15 @@ impl KvStore {
             self.slab.free(slot);
             return Err(());
         }
-        disk.free(disk_slot);
-
-        self.index.set_place(hash, Place::Ram(slot));
+        // Keep the disk copy, as the async path does: the block is clean the
+        // moment it lands, so pushing it back out costs nothing.
+        self.index.set_place(
+            hash,
+            Place::Ram {
+                slot,
+                backing: Some(disk_slot),
+            },
+        );
         self.stats.promoted_blocks += 1;
         self.reprice(hash);
         Ok(())
@@ -588,13 +743,14 @@ impl KvStore {
             .index
             .remove(victim)
             .expect("the policy only offers removable blocks");
-        match entry.place {
-            Place::Ram(slot) => self.slab.free(slot),
-            Place::Disk(slot) => self
-                .disk
+        if let Some(slot) = entry.place.ram() {
+            self.slab.free(slot);
+        }
+        if let Some(backing) = entry.place.backing() {
+            self.disk
                 .as_mut()
-                .expect("a disk block needs a tier")
-                .free(slot),
+                .expect("a disk copy needs a tier")
+                .free(backing);
         }
         self.stats.evicted_blocks += 1;
 

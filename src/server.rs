@@ -11,6 +11,7 @@
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -22,13 +23,41 @@ use crate::proto::{
     encode_info,
 };
 use crate::slab::PinnedBlock;
-use crate::store::{FetchPart, KvStore};
-use crate::tier::DiskReader;
+use crate::store::{FetchPart, KvStore, Writeback};
+use crate::tier::{DiskReader, DiskWriter};
+
+/// How often the writeback loop looks for dirty blocks to copy to disk.
+pub const DEFAULT_WRITEBACK_INTERVAL: Duration = Duration::from_millis(5);
+/// Blocks copied per round. Enough to stay ahead of admissions without
+/// holding the lock long while it picks them.
+pub const DEFAULT_WRITEBACK_BATCH: usize = 32;
+/// RAM utilization above which writeback runs. Below it there is no eviction
+/// pressure, so cleaning blocks would be work nobody needs.
+pub const DEFAULT_WRITEBACK_WATERMARK: f64 = 0.5;
 
 pub struct Server {
     listener: TcpListener,
     store: Arc<Mutex<KvStore>>,
     parallel_reads: usize,
+    writeback: Option<WritebackConfig>,
+}
+
+/// Tuning for the background writeback loop.
+#[derive(Clone, Copy, Debug)]
+pub struct WritebackConfig {
+    pub interval: Duration,
+    pub batch: usize,
+    pub watermark: f64,
+}
+
+impl Default for WritebackConfig {
+    fn default() -> Self {
+        Self {
+            interval: DEFAULT_WRITEBACK_INTERVAL,
+            batch: DEFAULT_WRITEBACK_BATCH,
+            watermark: DEFAULT_WRITEBACK_WATERMARK,
+        }
+    }
 }
 
 impl Server {
@@ -37,7 +66,15 @@ impl Server {
             listener: TcpListener::bind(addr).await?,
             store,
             parallel_reads: DEFAULT_PARALLEL_READS,
+            writeback: Some(WritebackConfig::default()),
         })
+    }
+
+    /// Tune, or with `None` disable, background writeback. Disabled, every
+    /// demotion pays for its own write with the store lock held.
+    pub fn with_writeback(mut self, writeback: Option<WritebackConfig>) -> Self {
+        self.writeback = writeback;
+        self
     }
 
     /// How many disk reads to have in flight per fetch. Higher gives the
@@ -54,6 +91,10 @@ impl Server {
 
     /// Accept forever, one task per connection.
     pub async fn run(self) -> io::Result<()> {
+        if let Some(config) = self.writeback {
+            tokio::spawn(writeback_loop(Arc::clone(&self.store), config));
+        }
+
         loop {
             let (socket, peer) = self.listener.accept().await?;
             let store = Arc::clone(&self.store);
@@ -324,6 +365,8 @@ async fn handle_stats(
         .u64(stats.rejected_blocks)
         .u64(stats.evicted_blocks)
         .u64(stats.demoted_blocks)
+        .u64(stats.blocking_demotions)
+        .u64(stats.written_back)
         .u64(stats.promoted_blocks)
         .u64(stats.bytes_admitted)
         .u64(resident as u64);
@@ -361,4 +404,68 @@ async fn write_error(
     frame.extend_from_slice(&header.encode());
     frame.extend_from_slice(&payload);
     socket.write_all(&frame).await
+}
+
+/// Copy dirty blocks to disk ahead of the eviction that will want them gone.
+///
+/// A block with a disk copy costs nothing to evict, so this converts what
+/// would be a blocking write on the admit path into a background one. It only
+/// runs under memory pressure: with RAM to spare there is no eviction coming,
+/// and cleaning blocks would be work nobody needs.
+async fn writeback_loop(store: Arc<Mutex<KvStore>>, config: WritebackConfig) {
+    loop {
+        tokio::time::sleep(config.interval).await;
+
+        let (jobs, writer) = {
+            let mut store = store.lock().await;
+            if store.utilization() < config.watermark {
+                continue;
+            }
+            // A job holds a pin, and pinned blocks cannot be evicted. Taking
+            // too large a share of RAM would starve the fetch path, which
+            // needs a free slot per block it promotes.
+            let budget = config.batch.min(store.ram_capacity() / 4).max(1);
+            (store.begin_writeback(budget), store.disk_writer())
+        };
+        if jobs.is_empty() {
+            continue;
+        }
+
+        let jobs = flush_to_disk(jobs, writer).await;
+        store.lock().await.finish_writeback(jobs);
+    }
+}
+
+/// Write the batch off the lock, striped the same way reads are.
+async fn flush_to_disk(jobs: Vec<Writeback>, writer: Option<DiskWriter>) -> Vec<Writeback> {
+    let Some(writer) = writer else {
+        return jobs;
+    };
+
+    let stripe = jobs.len().div_ceil(DEFAULT_PARALLEL_READS).max(1);
+    let mut tasks = Vec::new();
+    let mut rest = jobs;
+    while !rest.is_empty() {
+        let tail = rest.split_off(stripe.min(rest.len()));
+        let mut chunk = std::mem::replace(&mut rest, tail);
+        let writer = writer.clone();
+
+        tasks.push(tokio::task::spawn_blocking(move || {
+            for job in &mut chunk {
+                // A failed write leaves the block dirty, which is safe: it
+                // just means the next eviction pays for it.
+                let _ = job.flush(&writer);
+            }
+            chunk
+        }));
+    }
+
+    let mut done = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(chunk) => done.extend(chunk),
+            Err(_) => break,
+        }
+    }
+    done
 }

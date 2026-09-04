@@ -50,7 +50,12 @@ fn demoted(store: &KvStore, hashes: &[BlockHash]) -> Vec<BlockHash> {
 
 /// Fill a store past its RAM capacity and report every block admitted.
 fn overfill(store: &mut KvStore, count: u64) -> Vec<BlockHash> {
-    (1..=count)
+    overfill_from(store, 1, count)
+}
+
+/// Same, from a seed range that will not collide with an earlier call.
+fn overfill_from(store: &mut KvStore, start: u64, count: u64) -> Vec<BlockHash> {
+    (start..start + count)
         .map(|seed| admit_leaf(store, seed, 16))
         .collect()
 }
@@ -284,4 +289,127 @@ fn a_block_being_read_cannot_be_evicted_underneath() {
         assert_eq!(block.bytes(), expected(&store, block.hash()).as_slice());
     }
     store.unpin_all(&pinned);
+}
+
+/// Drive one writeback round the way the server's loop does.
+fn run_writeback(store: &mut KvStore, max: usize) -> usize {
+    let writer = store.disk_writer().unwrap();
+    let mut jobs = store.begin_writeback(max);
+    let count = jobs.len();
+    for job in &mut jobs {
+        job.flush(&writer).unwrap();
+    }
+    store.finish_writeback(jobs);
+    count
+}
+
+#[test]
+fn a_freshly_admitted_block_is_dirty_until_written_back() {
+    let mut store = tiered(4, 32);
+    overfill(&mut store, 4);
+    assert_eq!(store.dirty_blocks(), 4, "nothing has been copied yet");
+
+    assert_eq!(run_writeback(&mut store, 4), 4);
+    assert_eq!(store.dirty_blocks(), 0);
+    assert_eq!(store.stats().written_back, 4);
+    assert_eq!(store.resident_blocks(), 4, "still all in RAM");
+}
+
+#[test]
+fn evicting_a_clean_block_costs_no_write() {
+    let mut store = tiered(4, 32);
+    overfill(&mut store, 4);
+    run_writeback(&mut store, 4);
+
+    // RAM is full and every block already has a copy on disk.
+    admit_leaf(&mut store, 99, 16);
+
+    let stats = store.stats();
+    assert_eq!(stats.demoted_blocks, 1, "something left RAM");
+    assert_eq!(
+        stats.blocking_demotions, 0,
+        "and it did not write under the lock"
+    );
+}
+
+#[test]
+fn without_writeback_the_admit_path_pays_for_the_write() {
+    // The behaviour writeback exists to remove, kept as the contrast.
+    let mut store = tiered(4, 32);
+    overfill(&mut store, 5);
+
+    let stats = store.stats();
+    assert_eq!(stats.demoted_blocks, 1);
+    assert_eq!(stats.blocking_demotions, 1);
+    assert_eq!(stats.written_back, 0);
+}
+
+#[test]
+fn writeback_cleans_only_what_it_is_asked_for() {
+    let mut store = tiered(8, 32);
+    overfill(&mut store, 8);
+
+    assert_eq!(run_writeback(&mut store, 3), 3);
+    assert_eq!(store.dirty_blocks(), 5);
+    assert_eq!(
+        run_writeback(&mut store, 100),
+        5,
+        "the rest on the next pass"
+    );
+    assert_eq!(store.dirty_blocks(), 0);
+}
+
+#[test]
+fn an_unflushed_job_leaves_its_block_dirty_and_frees_the_slot() {
+    let mut store = tiered(4, 32);
+    overfill(&mut store, 4);
+
+    // Reserve the disk slots, then fail every write.
+    let jobs = store.begin_writeback(4);
+    assert_eq!(jobs.len(), 4);
+    store.finish_writeback(jobs);
+
+    assert_eq!(store.dirty_blocks(), 4, "still needs writing");
+    assert_eq!(store.stats().written_back, 0);
+    assert_eq!(store.disk_blocks(), 0, "reserved slots were given back");
+}
+
+#[test]
+fn a_written_back_block_reads_correctly_after_eviction() {
+    let mut store = tiered(4, 32);
+    let admitted = overfill(&mut store, 4);
+    run_writeback(&mut store, 4);
+
+    // Push them all out of RAM, using only the disk copies made above.
+    overfill_from(&mut store, 500, 8);
+
+    let off_ram = demoted(&store, &admitted);
+    assert!(!off_ram.is_empty());
+    let pinned = store.pin_run(&off_ram);
+    assert_eq!(pinned.len(), off_ram.len());
+    for block in &pinned {
+        assert_eq!(
+            block.bytes(),
+            expected(&store, block.hash()).as_slice(),
+            "the copy writeback made must be the real bytes"
+        );
+    }
+    store.unpin_all(&pinned);
+}
+
+#[test]
+fn a_promoted_block_keeps_its_disk_copy() {
+    // It came off disk, so the copy is already correct. Keeping it means
+    // pushing the block back out is free.
+    let mut store = tiered(4, 32);
+    let admitted = overfill(&mut store, 7);
+    let target = demoted(&store, &admitted)[0];
+
+    let pinned = store.pin_run(&[target]);
+    store.unpin_all(&pinned);
+
+    assert!(
+        !store.index().get(target).unwrap().place.is_dirty(),
+        "a block read off disk is already clean, so pushing it back out is free"
+    );
 }

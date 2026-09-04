@@ -410,3 +410,38 @@ async fn a_client_fetching_demoted_blocks_gets_the_right_bytes() {
     assert_eq!(resident, 48, "nothing was dropped");
     assert!(stats.promoted_blocks > 0, "blocks came back off disk");
 }
+
+#[tokio::test]
+async fn the_server_cleans_blocks_in_the_background() {
+    let layout = BlockLayout::tiny();
+    let disk = kvtier::tier::DiskTier::temporary(layout.block_bytes(), 256).unwrap();
+    let store = Arc::new(Mutex::new(
+        KvStore::new("test-model", layout, 16)
+            .unwrap()
+            .with_disk_tier(disk),
+    ));
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&store))
+        .await
+        .unwrap()
+        .with_writeback(Some(kvtier::server::WritebackConfig {
+            interval: std::time::Duration::from_millis(1),
+            batch: 32,
+            watermark: 0.5,
+        }));
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+
+    let mut client = KvClient::connect(addr).await.unwrap();
+    for seed in 0..4u64 {
+        let (names, payloads) = sequence(&tokens(64, 900 + seed));
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        client.put_blocks(None, &names, &refs).await.unwrap();
+    }
+
+    // RAM is over the watermark, so the loop has work to do.
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    let (stats, _) = client.stats().await.unwrap();
+    assert!(stats.written_back > 0, "the writeback loop must have run");
+    assert_eq!(store.lock().await.dirty_blocks(), 0, "everything is clean");
+}

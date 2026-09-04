@@ -117,12 +117,15 @@ impl GreedyDual {
             if key(entry.priority) != candidate.key {
                 continue; // touched since; a fresher candidate is in the heap
             }
-            if entry.pins > 0 || !accept(entry) {
-                continue; // re-offered when it next qualifies
-            }
-            if Some(candidate.hash) == protect {
+            // A pin is temporary and carries no reprice when it lifts, so
+            // dropping these would quietly drain the heap of every block
+            // writeback ever touched.
+            if entry.pins > 0 || Some(candidate.hash) == protect {
                 deferred.push(Reverse(candidate));
                 continue;
+            }
+            if !accept(entry) {
+                continue; // moved tier, and repriced onto the other heap
             }
             victim = Some((candidate.hash, entry.priority));
             break;
@@ -130,6 +133,41 @@ impl GreedyDual {
 
         self.heap.extend(deferred);
         victim
+    }
+
+    /// The `count` lowest-priority blocks matching `accept`, left in place.
+    ///
+    /// Writeback uses this to clean the blocks nearest the eviction frontier,
+    /// so the ones most likely to go are already safe on disk by the time
+    /// their turn comes.
+    pub fn peek_victims(
+        &mut self,
+        index: &Index,
+        count: usize,
+        accept: impl Fn(&Entry) -> bool,
+    ) -> Vec<BlockHash> {
+        let mut found = Vec::with_capacity(count);
+        let mut seen = Vec::new();
+
+        while found.len() < count {
+            let Some(Reverse(candidate)) = self.heap.pop() else {
+                break;
+            };
+            let Some(entry) = index.get(candidate.hash) else {
+                continue; // gone
+            };
+            if key(entry.priority) != candidate.key {
+                continue; // stale
+            }
+            if entry.pins == 0 && accept(entry) {
+                found.push(candidate.hash);
+            }
+            seen.push(Reverse(candidate));
+        }
+
+        // Nothing is evicted here, so everything still valid goes back.
+        self.heap.extend(seen);
+        found
     }
 
     pub fn note_eviction(&mut self, priority: f64) {

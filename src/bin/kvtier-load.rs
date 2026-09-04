@@ -3,11 +3,11 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kvtier::block::{BlockHash, BlockLayout};
 use kvtier::client::KvClient;
-use kvtier::server::Server;
+use kvtier::server::{Server, WritebackConfig};
 use kvtier::store::KvStore;
 use kvtier::tier::DiskTier;
 use kvtier::trace::SplitMix64;
@@ -93,6 +93,67 @@ async fn main() -> std::io::Result<()> {
 
     concurrency_sweep(addr, &hashes[..8], block_bytes).await?;
     cold_fetch_sweep(&layout).await?;
+    writeback_sweep(&layout).await?;
+    Ok(())
+}
+
+/// Admissions under memory pressure, with and without background writeback.
+///
+/// Every admit past capacity has to push something out of RAM. Without
+/// writeback that means a 2 MiB write with the store lock held, on the
+/// critical path of a request. With it, the block already has a copy on disk
+/// and the eviction is bookkeeping.
+async fn writeback_sweep(layout: &BlockLayout) -> std::io::Result<()> {
+    const RAM: usize = 64;
+    const BLOCKS: usize = 512;
+
+    let block_bytes = layout.block_bytes();
+    println!("\nadmissions under pressure: {BLOCKS} blocks into {RAM} of RAM");
+    println!(
+        "{:>12}  {:>12}  {:>12}  {:>12}",
+        "writeback", "ms total", "blocking", "written back"
+    );
+
+    for enabled in [false, true] {
+        let disk = DiskTier::temporary(block_bytes, BLOCKS * 2)?;
+        disk.try_bypass_page_cache();
+        let store = KvStore::new("bench", layout.clone(), RAM)?.with_disk_tier(disk);
+        let server = Server::bind("127.0.0.1:0".parse().unwrap(), Arc::new(Mutex::new(store)))
+            .await?
+            .with_writeback(enabled.then(|| WritebackConfig {
+                interval: Duration::from_millis(1),
+                batch: 32,
+                watermark: 0.5,
+            }));
+        let addr: SocketAddr = server.local_addr()?;
+        tokio::spawn(server.run());
+
+        let mut client = KvClient::connect(addr).await?;
+        let payload = vec![0xEFu8; block_bytes];
+        let mut rng = SplitMix64::new(enabled as u64);
+
+        let start = Instant::now();
+        for depth in 0..BLOCKS {
+            let mut bytes = [0u8; 16];
+            bytes[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+            bytes[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+            let hash = BlockHash::from_bytes(bytes);
+
+            // Independent blocks, so every one past capacity forces an eviction.
+            let names = [(hash, ((depth + 1) * layout.tokens_per_block) as u32)];
+            client.put_blocks(None, &names, &[&payload]).await?;
+        }
+        let elapsed = start.elapsed();
+
+        let (stats, _) = client.stats().await?;
+        println!(
+            "{:>12}  {:>12.0}  {:>12}  {:>12}",
+            if enabled { "on" } else { "off" },
+            elapsed.as_secs_f64() * 1000.0,
+            stats.blocking_demotions,
+            stats.written_back
+        );
+    }
     Ok(())
 }
 

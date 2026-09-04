@@ -18,31 +18,61 @@ use crate::block::BlockHash;
 use crate::slab::SlotId;
 use crate::tier::DiskSlot;
 
-/// Which tier holds a block's bytes. Both count as resident: a hit on a
-/// demoted block is still a hit, it just costs a read.
+/// Where a block's bytes are. Either counts as resident: a hit on a demoted
+/// block is still a hit, it just costs a read.
+///
+/// A RAM block may also hold a disk copy. That copy is what makes eviction
+/// free -- the bytes are already safe, so reclaiming the slot is bookkeeping
+/// rather than I/O. Blocks are immutable once published, so a copy taken any
+/// time after admission stays valid forever.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Place {
-    Ram(SlotId),
+    Ram {
+        slot: SlotId,
+        backing: Option<DiskSlot>,
+    },
     Disk(DiskSlot),
 }
 
 impl Place {
+    pub fn dirty(slot: SlotId) -> Self {
+        Place::Ram {
+            slot,
+            backing: None,
+        }
+    }
+
     pub fn ram(self) -> Option<SlotId> {
         match self {
-            Place::Ram(slot) => Some(slot),
+            Place::Ram { slot, .. } => Some(slot),
             Place::Disk(_) => None,
         }
     }
 
+    /// Set only when the block has been pushed out of RAM entirely.
     pub fn disk(self) -> Option<DiskSlot> {
         match self {
             Place::Disk(slot) => Some(slot),
-            Place::Ram(_) => None,
+            Place::Ram { .. } => None,
+        }
+    }
+
+    /// The disk slot this block occupies in either state.
+    pub fn backing(self) -> Option<DiskSlot> {
+        match self {
+            Place::Ram { backing, .. } => backing,
+            Place::Disk(slot) => Some(slot),
         }
     }
 
     pub fn is_ram(self) -> bool {
-        matches!(self, Place::Ram(_))
+        matches!(self, Place::Ram { .. })
+    }
+
+    /// In RAM with no disk copy, so its slot cannot be reclaimed without a
+    /// write first.
+    pub fn is_dirty(self) -> bool {
+        matches!(self, Place::Ram { backing: None, .. })
     }
 }
 
@@ -268,7 +298,7 @@ mod tests {
     use crate::block::{BlockLayout, PrefixHasher, TokenId};
 
     fn slot(n: u32) -> Place {
-        Place::Ram(SlotId::for_tests(n))
+        Place::dirty(SlotId::for_tests(n))
     }
 
     fn chain(n: usize) -> Vec<BlockHash> {
