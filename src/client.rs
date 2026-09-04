@@ -97,6 +97,50 @@ impl KvClient {
         Ok(blocks)
     }
 
+    /// Same run as `get_blocks`, written straight into `out` instead of into
+    /// a fresh allocation per block. Returns how many blocks were written.
+    ///
+    /// The caller owns the destination, so KV can land in page-locked memory
+    /// the GPU will DMA out of, rather than in a heap buffer that has to be
+    /// copied again on its way there.
+    pub async fn get_blocks_into(
+        &mut self,
+        hashes: &[BlockHash],
+        out: &mut [u8],
+    ) -> io::Result<usize> {
+        let block_bytes = self.block_bytes();
+        let capacity = out.len() / block_bytes;
+        let hashes = &hashes[..hashes.len().min(capacity)];
+
+        let per_frame = blocks_per_frame(block_bytes);
+        let mut done = 0;
+
+        while done < hashes.len() {
+            let want = &hashes[done..];
+            let want = &want[..want.len().min(per_frame)];
+
+            let mut writer = Writer::new();
+            writer.hashes(want);
+            let payload = self.round_trip(Opcode::GetBlocks, &writer.finish()).await?;
+
+            let mut reader = Reader::new(&payload);
+            let count = reader.block_count()?;
+            for _ in 0..count {
+                let start = done * block_bytes;
+                out[start..start + block_bytes].copy_from_slice(reader.bytes(block_bytes)?);
+                done += 1;
+            }
+            reader.finish()?;
+
+            // A frame the server did not fill means it ran out of resident
+            // blocks, not out of frame.
+            if count < want.len() {
+                break;
+            }
+        }
+        Ok(done)
+    }
+
     async fn get_one_frame(&mut self, hashes: &[BlockHash]) -> io::Result<Vec<Vec<u8>>> {
         let mut writer = Writer::new();
         writer.hashes(hashes);
