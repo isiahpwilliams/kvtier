@@ -1,12 +1,24 @@
-"""Driver: run the TTFT benchmark for both arms, across GPU cache sizes.
+"""Driver: TTFT for each arm, across GPU KV cache sizes.
 
-Starts a kvtierd sized for the model, then runs bench_ttft.py once per arm per
-GPU KV cache size, each in its own process so every arm gets a cold engine.
+Three arms, each on a cold engine in its own process:
+
+  baseline    no connector. vLLM's own prefix cache, which is the only
+              honest thing to compare against.
+  tier-cold   fresh kvtierd, one pass. The tier fills and reads in the same
+              pass, so a conversation's turn t+1 can hit what its turn t
+              stored, and nothing else is there.
+  tier-warm   fresh kvtierd, filled by an untimed pass, then a *new* engine
+              times a second pass. The GPU cache starts empty and the tier
+              starts full: another replica's traffic, or yesterday's.
+
+Each tier arm gets its own daemon, started empty and killed afterwards. An
+earlier version of this script started one daemon for the whole sweep, which
+quietly turned every run after the first into a warm-tier run and made the
+sweep points incomparable.
 
 The GPU cache sweep is the point. A tier cannot beat a GPU cache that already
-holds the prefix, so a single large-cache run would only measure the tier's
-overhead. Sweeping down through the working set shows where it starts paying,
-and the top of the sweep is kept precisely so the overhead is visible too.
+holds the prefix, so the top of the sweep measures the tier's overhead and the
+bottom measures what it buys.
 
 Run with: .venv/bin/python python/run_ttft.py --help
 """
@@ -18,8 +30,6 @@ import socket
 import subprocess
 import sys
 import time
-
-import torch
 
 
 def model_layout(model, dtype_name):
@@ -42,7 +52,8 @@ def free_port():
         return sock.getsockname()[1]
 
 
-def start_daemon(port, model, layout, blocks, log):
+def start_daemon(model, layout, blocks, log):
+    port = free_port()
     env = {
         **os.environ,
         "KVTIER_ADDR": f"127.0.0.1:{port}",
@@ -62,18 +73,18 @@ def start_daemon(port, model, layout, blocks, log):
     for _ in range(400):
         try:
             socket.create_connection(("127.0.0.1", port), timeout=0.1).close()
-            return daemon
+            return daemon, f"127.0.0.1:{port}"
         except OSError:
             time.sleep(0.05)
     daemon.kill()
     raise RuntimeError("kvtierd did not come up")
 
 
-def run_arm(args, arm, addr, kv_bytes, out_path, log_path):
+def run_engine(args, arm, addr, kv_bytes, out_path, log_path):
     cmd = [
         sys.executable, "python/bench_ttft.py",
         "--model", args.model,
-        "--arm", arm,
+        "--arm", "baseline" if arm == "baseline" else "tier",
         "--addr", addr,
         "--out", out_path,
         "--conversations", str(args.conversations),
@@ -101,72 +112,92 @@ def main():
     parser.add_argument("--turns", type=int, default=4)
     parser.add_argument("--system-tokens", type=int, default=1800)
     parser.add_argument("--turn-tokens", type=int, default=400)
-    parser.add_argument("--max-model-len", type=int, default=8192)
-    parser.add_argument("--tier-blocks", type=int, default=32768)
-    parser.add_argument(
-        "--kv-cache-mib", type=int, nargs="+", default=[256, 512, 1024, 4096]
-    )
+    parser.add_argument("--max-model-len", type=int, default=3584)
+    parser.add_argument("--tier-blocks", type=int, default=8192)
+    parser.add_argument("--kv-cache-mib", type=int, nargs="+",
+                        default=[256, 1024, 4096])
     parser.add_argument("--results", default="bench_results")
+    parser.add_argument("--repeat", type=int, default=2)
     args = parser.parse_args()
 
     os.makedirs(args.results, exist_ok=True)
     layout = model_layout(args.model, args.dtype)
     block_bytes = (
-        2 * layout["layers"] * 16 * layout["kv_heads"] * layout["head_dim"]
-        * (2 if args.dtype in ("f16", "bf16") else 4)
+        2 * layout["layers"] * 16 * layout["kv_heads"] * layout["head_dim"] * 2
     )
     print(f"model {args.model}")
     print(f"layout {layout}, block {block_bytes / 1024:.0f} KiB")
-    print(f"tier capacity {args.tier_blocks} blocks = "
-          f"{args.tier_blocks * block_bytes / 2**30:.1f} GiB")
 
-    port = free_port()
-    addr = f"127.0.0.1:{port}"
-    daemon = start_daemon(
-        port, args.model, layout, args.tier_blocks,
-        os.path.join(args.results, "kvtierd.log"),
-    )
-    print(f"kvtierd on {addr}")
-
+    arms = ("baseline", "tier-cold", "tier-warm")
     summary = {}
-    try:
+    for rep in range(args.repeat):
         for mib in args.kv_cache_mib:
             kv_bytes = mib * 2**20
-            print(f"\n=== GPU KV cache {mib} MiB "
+            print(f"\n=== repeat {rep}, GPU KV cache {mib} MiB "
                   f"({kv_bytes // block_bytes} blocks) ===")
-            for arm in ("baseline", "tier"):
-                tag = f"{arm}_{mib}mib"
-                result = run_arm(
-                    args, arm, addr, kv_bytes,
-                    os.path.join(args.results, f"{tag}.json"),
-                    os.path.join(args.results, f"{tag}.log"),
-                )
+            for arm in arms:
+                tag = f"{arm}_{mib}mib_r{rep}"
+                daemon, addr = None, "127.0.0.1:1"
+                try:
+                    if arm != "baseline":
+                        daemon, addr = start_daemon(
+                            args.model, layout, args.tier_blocks,
+                            os.path.join(args.results, f"{tag}_daemon.log"),
+                        )
+                    if arm == "tier-warm":
+                        # Untimed pass to fill the tier, then a cold engine.
+                        run_engine(
+                            args, arm, addr, kv_bytes,
+                            os.path.join(args.results, f"{tag}_fill.json"),
+                            os.path.join(args.results, f"{tag}_fill.log"),
+                        )
+                    result = run_engine(
+                        args, arm, addr, kv_bytes,
+                        os.path.join(args.results, f"{tag}.json"),
+                        os.path.join(args.results, f"{tag}.log"),
+                    )
+                finally:
+                    if daemon is not None:
+                        daemon.terminate()
+                        daemon.wait(timeout=10)
                 if result is None:
                     continue
                 s = result["summary"]
                 summary[tag] = s
-                print(f"  {arm:9s} median {s['median'] * 1000:8.1f} ms   " +
-                      "  ".join(
-                          f"t{t}:{v['median'] * 1000:.0f}"
-                          for t, v in s["by_turn"].items()
-                      ))
-    finally:
-        daemon.terminate()
-        daemon.wait(timeout=10)
+                hits = ""
+                if "tier_stats" in result:
+                    st = result["tier_stats"]
+                    rate = st["hit_blocks"] / max(1, st["queried_blocks"]) * 100
+                    hits = f"  [tier {rate:.0f}% of {st['queried_blocks']} queried]"
+                print(f"  {arm:10s} median {s['median'] * 1000:8.1f} ms   " +
+                      "  ".join(f"t{t}:{v['median'] * 1000:.0f}"
+                                for t, v in s["by_turn"].items()) + hits)
 
     with open(os.path.join(args.results, "summary.json"), "w") as f:
         json.dump(summary, f, indent=1)
 
-    print("\n=== TTFT median, ms ===")
-    print(f"{'GPU KV cache':>14}  {'baseline':>9}  {'tier':>9}  {'change':>9}")
+    print("\n=== TTFT median, ms (repeats listed; spread is the noise floor) ===")
+    header = f"{'GPU KV cache':>13}"
+    for arm in arms:
+        header += f"  {arm:>16}"
+    print(header + f"  {'cold vs base':>13}  {'warm vs base':>13}")
     for mib in args.kv_cache_mib:
-        b = summary.get(f"baseline_{mib}mib")
-        t = summary.get(f"tier_{mib}mib")
-        if not b or not t:
-            continue
-        change = (t["median"] - b["median"]) / b["median"] * 100
-        print(f"{mib:>10} MiB  {b['median'] * 1000:9.1f}  "
-              f"{t['median'] * 1000:9.1f}  {change:+8.1f}%")
+        cells, best = [], {}
+        for arm in arms:
+            vals = [summary[f"{arm}_{mib}mib_r{r}"]["median"] * 1000
+                    for r in range(args.repeat)
+                    if f"{arm}_{mib}mib_r{r}" in summary]
+            if not vals:
+                cells.append(f"{'-':>16}")
+                continue
+            best[arm] = min(vals)
+            cells.append(f"{'/'.join(f'{v:.1f}' for v in vals):>16}")
+        line = f"{mib:>9} MiB" + "  ".join([""] + cells)
+        for arm in ("tier-cold", "tier-warm"):
+            if arm in best and "baseline" in best:
+                delta = (best[arm] - best["baseline"]) / best["baseline"] * 100
+                line += f"  {delta:+12.1f}%"
+        print(line)
     print("RUN_TTFT_DONE")
 
 

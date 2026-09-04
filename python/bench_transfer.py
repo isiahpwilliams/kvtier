@@ -148,17 +148,24 @@ def main():
         target = torch.arange(n, device="cuda")
         staged = slab[: n * block_bytes].view(dtype).view(n, len(views), elems)
 
-        def load():
+        def wire():
             got = client.fetch_into(want, slab.numpy())
             assert got == n, got
+
+        def scatter():
             resident = staged.to("cuda", non_blocking=True)
             for layer, view in enumerate(views):
                 view.index_copy_(0, target, resident[:, layer, :])
 
+        def load():
+            wire()
+            scatter()
+
+        moved = n * block_bytes
+        on_wire = statistics.median(time_it(wire, args.repeats))
+        on_gpu = statistics.median(time_it(scatter, args.repeats))
         samples = time_it(load, args.repeats)
         median = statistics.median(samples)
-        spread = (max(samples) - min(samples)) / median
-        moved = n * block_bytes
         results.append(
             {
                 "blocks": n,
@@ -167,15 +174,19 @@ def main():
                 "median_s": median,
                 "min_s": min(samples),
                 "max_s": max(samples),
-                "spread": spread,
+                "spread": (max(samples) - min(samples)) / median,
+                "wire_s": on_wire,
+                "scatter_s": on_gpu,
                 "gib_per_s": moved / median / 2**30,
+                "wire_gib_per_s": moved / on_wire / 2**30,
+                "scatter_gib_per_s": moved / on_gpu / 2**30,
             }
         )
         print(
-            f"  {n:4d} blocks ({n * args.block_size:6d} tokens, "
-            f"{moved / 2**20:8.1f} MiB): median {median * 1000:8.3f} ms  "
-            f"[{min(samples) * 1000:.3f}-{max(samples) * 1000:.3f}]  "
-            f"{moved / median / 2**30:5.2f} GiB/s"
+            f"  {n:4d} blocks ({n * args.block_size:6d} tok, {moved / 2**20:7.1f} MiB): "
+            f"total {median * 1000:7.2f} ms = wire {on_wire * 1000:7.2f} "
+            f"({moved / on_wire / 2**30:5.2f} GiB/s) + gpu {on_gpu * 1000:6.2f} "
+            f"({moved / on_gpu / 2**30:5.2f} GiB/s)"
         )
 
     out = {

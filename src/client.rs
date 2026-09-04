@@ -119,18 +119,10 @@ impl KvClient {
             let want = &hashes[done..];
             let want = &want[..want.len().min(per_frame)];
 
-            let mut writer = Writer::new();
-            writer.hashes(want);
-            let payload = self.round_trip(Opcode::GetBlocks, &writer.finish()).await?;
-
-            let mut reader = Reader::new(&payload);
-            let count = reader.block_count()?;
-            for _ in 0..count {
-                let start = done * block_bytes;
-                out[start..start + block_bytes].copy_from_slice(reader.bytes(block_bytes)?);
-                done += 1;
-            }
-            reader.finish()?;
+            let count = self
+                .get_frame_into(want, &mut out[done * block_bytes..])
+                .await?;
+            done += count;
 
             // A frame the server did not fill means it ran out of resident
             // blocks, not out of frame.
@@ -139,6 +131,59 @@ impl KvClient {
             }
         }
         Ok(done)
+    }
+
+    /// One frame of blocks, read straight from the socket into `out`.
+    ///
+    /// `round_trip` stages the whole response in a heap buffer and the caller
+    /// copies it out again. For a fetch that buffer is the KV itself, so both
+    /// the allocation and the copy are worth removing. Kept separate from
+    /// `round_trip` rather than sharing helpers with it: pulling the header
+    /// read out into a shared function measurably slowed the generic path.
+    async fn get_frame_into(&mut self, hashes: &[BlockHash], out: &mut [u8]) -> io::Result<usize> {
+        let block_bytes = self.block_bytes();
+
+        let mut writer = Writer::new();
+        writer.hashes(hashes);
+        let request_id = self.send(Opcode::GetBlocks, &writer.finish()).await?;
+
+        let mut header_bytes = [0u8; HEADER_BYTES];
+        self.socket.read_exact(&mut header_bytes).await?;
+        let response = Header::decode(&header_bytes)?;
+        if response.request_id != request_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "response id {} for request {request_id}",
+                    response.request_id
+                ),
+            ));
+        }
+        if response.opcode == Opcode::Error {
+            let mut body = vec![0u8; response.payload_len as usize];
+            self.socket.read_exact(&mut body).await?;
+            let message = Reader::new(&body).string()?;
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, message));
+        }
+
+        let mut count_bytes = [0u8; 4];
+        self.socket.read_exact(&mut count_bytes).await?;
+        let count = u32::from_be_bytes(count_bytes) as usize;
+
+        if count > hashes.len() || response.payload_len as usize != 4 + count * block_bytes {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "{count} blocks in a {} byte frame for {} names",
+                    response.payload_len,
+                    hashes.len()
+                ),
+            ));
+        }
+        self.socket
+            .read_exact(&mut out[..count * block_bytes])
+            .await?;
+        Ok(count)
     }
 
     async fn get_one_frame(&mut self, hashes: &[BlockHash]) -> io::Result<Vec<Vec<u8>>> {
@@ -250,7 +295,7 @@ impl KvClient {
         Ok(decode_info(&payload)?)
     }
 
-    async fn round_trip(&mut self, opcode: Opcode, payload: &[u8]) -> io::Result<Vec<u8>> {
+    async fn send(&mut self, opcode: Opcode, payload: &[u8]) -> io::Result<u32> {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
 
@@ -259,6 +304,11 @@ impl KvClient {
         frame.extend_from_slice(&header.encode());
         frame.extend_from_slice(payload);
         self.socket.write_all(&frame).await?;
+        Ok(request_id)
+    }
+
+    async fn round_trip(&mut self, opcode: Opcode, payload: &[u8]) -> io::Result<Vec<u8>> {
+        let request_id = self.send(opcode, payload).await?;
 
         let mut header_bytes = [0u8; HEADER_BYTES];
         self.socket.read_exact(&mut header_bytes).await?;

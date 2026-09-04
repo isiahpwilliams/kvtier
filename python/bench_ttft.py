@@ -22,6 +22,7 @@ Run with: .venv/bin/python python/bench_ttft.py --help
 
 import argparse
 import json
+import math
 import os
 import statistics
 import sys
@@ -106,18 +107,31 @@ def run_arm(args, use_tier, addr):
     return records
 
 
+def quantile(values, q):
+    """Nearest-rank quantile. Small samples make interpolation a lie."""
+    ordered = sorted(values)
+    rank = max(1, math.ceil(q * len(ordered)))
+    return ordered[rank - 1]
+
+
 def summarize(records):
     by_turn = {}
     for r in records:
         by_turn.setdefault(r["turn"], []).append(r["ttft"])
+    everything = [r["ttft"] for r in records]
     return {
         "n": len(records),
-        "median": statistics.median(r["ttft"] for r in records),
-        "mean": statistics.fmean(r["ttft"] for r in records),
+        "median": statistics.median(everything),
+        "mean": statistics.fmean(everything),
+        "p25": quantile(everything, 0.25),
+        "p75": quantile(everything, 0.75),
+        "p90": quantile(everything, 0.90),
         "by_turn": {
             turn: {
                 "median": statistics.median(v),
-                "p90": sorted(v)[int(0.9 * (len(v) - 1))],
+                "p25": quantile(v, 0.25),
+                "p75": quantile(v, 0.75),
+                "p90": quantile(v, 0.90),
                 "n": len(v),
             }
             for turn, v in sorted(by_turn.items())
@@ -162,7 +176,8 @@ def main():
     print(f"{args.arm}: median TTFT {s['median'] * 1000:.1f} ms over {s['n']} requests")
     for turn, stats in s["by_turn"].items():
         print(f"  turn {turn}: median {stats['median'] * 1000:7.1f} ms  "
-              f"p90 {stats['p90'] * 1000:7.1f} ms")
+              f"iqr {stats['p25'] * 1000:.1f}-{stats['p75'] * 1000:.1f}  "
+              f"p90 {stats['p90'] * 1000:7.1f} ms  n={stats['n']}")
     print("BENCH_DONE")
 
 
