@@ -68,7 +68,13 @@ def start_daemon(model, layout, blocks, log):
     }
     handle = open(log, "w")
     daemon = subprocess.Popen(
-        ["target/release/kvtierd"], env=env, stdout=handle, stderr=handle
+        ["target/release/kvtierd"],
+        env=env,
+        stdout=handle,
+        stderr=handle,
+        # Its own session, so a shutting-down engine cannot take the daemon
+        # with it if it signals its process group on the way out.
+        start_new_session=True,
     )
     for _ in range(400):
         try:
@@ -78,6 +84,32 @@ def start_daemon(model, layout, blocks, log):
             time.sleep(0.05)
     daemon.kill()
     raise RuntimeError("kvtierd did not come up")
+
+
+def gpu_free_mib():
+    out = subprocess.run(
+        ["nvidia-smi", "--query-gpu=memory.used", "--format=csv,noheader,nounits"],
+        capture_output=True, text=True,
+    )
+    return int(out.stdout.strip().splitlines()[0])
+
+
+def wait_for_gpu(limit_mib=1024, timeout=120):
+    """Block until the last engine has actually given the GPU back.
+
+    subprocess.run returns when the driver process exits, but vLLM's EngineCore
+    is a child of that and can still be holding several GiB. Starting the next
+    engine then fails its own free-memory check, which looks like a flaky
+    benchmark and is really just a race with teardown.
+    """
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        used = gpu_free_mib()
+        if used <= limit_mib:
+            return True
+        time.sleep(1)
+    print(f"  GPU still holding {gpu_free_mib()} MiB after {timeout}s")
+    return False
 
 
 def run_engine(args, arm, addr, kv_bytes, out_path, log_path):
@@ -93,15 +125,26 @@ def run_engine(args, arm, addr, kv_bytes, out_path, log_path):
         "--turn-tokens", str(args.turn_tokens),
         "--max-model-len", str(args.max_model_len),
         "--kv-cache-bytes", str(kv_bytes),
+        "--gpu-fraction", str(args.gpu_fraction),
     ]
     env = {**os.environ, "PYTHONPATH": os.path.abspath("python")}
-    with open(log_path, "w") as log:
-        proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
-    if proc.returncode != 0:
-        print(f"  {arm} FAILED, see {log_path}")
-        return None
-    with open(out_path) as f:
-        return json.load(f)
+    # Two attempts. An engine can fail its own free-memory check because the
+    # previous one has not finished handing the GPU back -- EngineCore is a
+    # child of the process we waited on, so its teardown outlives that wait.
+    # Retrying is cheaper and more honest than pretending the arm failed.
+    for attempt in range(2):
+        wait_for_gpu()
+        with open(log_path, "w") as log:
+            proc = subprocess.run(cmd, env=env, stdout=log, stderr=subprocess.STDOUT)
+        wait_for_gpu()
+        if proc.returncode == 0:
+            with open(out_path) as f:
+                return json.load(f)
+        if attempt == 0:
+            print(f"  {arm} failed once, retrying")
+            time.sleep(20)
+    print(f"  {arm} FAILED, see {log_path}")
+    return None
 
 
 def main():
@@ -118,6 +161,15 @@ def main():
                         default=[256, 1024, 4096])
     parser.add_argument("--results", default="bench_results")
     parser.add_argument("--repeat", type=int, default=2)
+    parser.add_argument(
+        "--skip-existing", action="store_true",
+        help="leave arms that already have a result, to top up a partial sweep",
+    )
+    parser.add_argument(
+        "--gpu-fraction", type=float, default=0.55,
+        help="only a startup sanity check here, since kv_cache_memory_bytes "
+             "is set explicitly; kept low so a slow teardown is not fatal",
+    )
     args = parser.parse_args()
 
     os.makedirs(args.results, exist_ok=True)
@@ -137,6 +189,12 @@ def main():
                   f"({kv_bytes // block_bytes} blocks) ===")
             for arm in arms:
                 tag = f"{arm}_{mib}mib_r{rep}"
+                done_path = os.path.join(args.results, f"{tag}.json")
+                if args.skip_existing and os.path.exists(done_path):
+                    with open(done_path) as f:
+                        summary[tag] = json.load(f)["summary"]
+                    print(f"  {arm:10s} already have it")
+                    continue
                 daemon, addr = None, "127.0.0.1:1"
                 try:
                     if arm != "baseline":
@@ -151,6 +209,13 @@ def main():
                             os.path.join(args.results, f"{tag}_fill.json"),
                             os.path.join(args.results, f"{tag}_fill.log"),
                         )
+                        # The timed pass needs the daemon the fill pass filled.
+                        # If it is gone, say so: a restarted daemon would be
+                        # empty and this would quietly become a cold-tier run.
+                        code = daemon.poll()
+                        if code is not None:
+                            print(f"  {arm} daemon died after the fill pass, "
+                                  f"exit {code}")
                     result = run_engine(
                         args, arm, addr, kv_bytes,
                         os.path.join(args.results, f"{tag}.json"),
