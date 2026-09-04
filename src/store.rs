@@ -6,8 +6,8 @@ use std::io;
 use crate::block::{BlockHash, BlockLayout, PrefixHasher, TokenId};
 use crate::evict::{CostModel, GreedyDual};
 use crate::index::{Index, Place};
-use crate::slab::{PinnedBlock, Slab};
-use crate::tier::{DiskStats, DiskTier, TierCosts};
+use crate::slab::{BlockWriter, PinnedBlock, Slab, SlotId};
+use crate::tier::{DiskReader, DiskSlot, DiskStats, DiskTier, TierCosts};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -63,6 +63,31 @@ impl Lookup {
 
     pub fn is_full_hit(&self) -> bool {
         !self.hashes.is_empty() && self.matched == self.hashes.len()
+    }
+}
+
+/// One block of a fetch: already in RAM, or waiting on a disk read.
+pub enum FetchPart {
+    Ready(PinnedBlock),
+    Pending(Promotion),
+}
+
+/// A demoted block with a RAM slot reserved for it, waiting to be filled.
+pub struct Promotion {
+    hash: BlockHash,
+    disk_slot: DiskSlot,
+    writer: BlockWriter,
+    filled: bool,
+}
+
+impl Promotion {
+    /// Read the block off disk. Safe to call with the store lock released:
+    /// the destination slot is not in the index, so nothing can see it, and
+    /// the block is pinned, so nothing can evict what we are reading.
+    pub fn fill(&mut self, reader: &DiskReader) -> std::io::Result<()> {
+        reader.read(self.disk_slot, self.writer.bytes_mut())?;
+        self.filled = true;
+        Ok(())
     }
 }
 
@@ -281,6 +306,113 @@ impl KvStore {
         self.stats.queried_blocks += hashes.len() as u64;
         self.stats.hit_blocks += pinned.len() as u64;
         pinned
+    }
+
+    /// Reserve the resident leading run without doing any I/O.
+    ///
+    /// Blocks already in RAM come back ready; demoted ones come back as
+    /// `Pending`, pinned and holding a reserved RAM slot, for the caller to
+    /// fill off the lock. Pair every call with `finish_fetch`, or the pins
+    /// and slots reserved here leak.
+    pub fn begin_fetch(&mut self, hashes: &[BlockHash]) -> Vec<FetchPart> {
+        let mut parts: Vec<FetchPart> = Vec::with_capacity(hashes.len());
+
+        for &hash in hashes {
+            let Some(place) = self.index.pin(hash) else {
+                break; // a gap ends the run
+            };
+            self.reprice(hash);
+
+            match place {
+                Place::Ram(slot) => parts.push(FetchPart::Ready(self.slab.pinned(hash, slot))),
+                Place::Disk(disk_slot) => {
+                    // The pin above keeps this block off both eviction heaps
+                    // while we are reading it.
+                    let Some(slot) = self.reserve_slot(hash) else {
+                        self.index.unpin(hash);
+                        break;
+                    };
+                    parts.push(FetchPart::Pending(Promotion {
+                        hash,
+                        disk_slot,
+                        writer: self.slab.writer(slot),
+                        filled: false,
+                    }));
+                }
+            }
+        }
+
+        self.stats.lookups += 1;
+        self.stats.queried_blocks += hashes.len() as u64;
+        self.stats.hit_blocks += parts.len() as u64;
+        parts
+    }
+
+    fn reserve_slot(&mut self, protect: BlockHash) -> Option<SlotId> {
+        match self.slab.alloc() {
+            Some(slot) => Some(slot),
+            None => match self.make_room(Some(protect)) {
+                Ok(()) => self.slab.alloc(),
+                Err(_) => None,
+            },
+        }
+    }
+
+    /// Publish whatever the caller managed to fill, and hand back the run.
+    ///
+    /// Truncates at the first unfilled block: a run with a hole in it is not
+    /// a run, and the engine cannot use anything past the gap.
+    pub fn finish_fetch(&mut self, parts: Vec<FetchPart>) -> Vec<PinnedBlock> {
+        let mut pinned = Vec::with_capacity(parts.len());
+        let mut truncated = false;
+        let mut reads = 0u64;
+        let mut bytes = 0u64;
+
+        for part in parts {
+            match part {
+                _ if truncated => match part {
+                    FetchPart::Ready(block) => self.index.unpin(block.hash()),
+                    FetchPart::Pending(promotion) => self.abandon(promotion),
+                },
+                FetchPart::Ready(block) => pinned.push(block),
+                FetchPart::Pending(promotion) if promotion.filled => {
+                    reads += 1;
+                    bytes += self.layout.block_bytes() as u64;
+                    pinned.push(self.publish(promotion));
+                }
+                FetchPart::Pending(promotion) => {
+                    self.abandon(promotion);
+                    truncated = true;
+                }
+            }
+        }
+
+        if let Some(disk) = self.disk.as_mut() {
+            disk.note_reads(reads, bytes);
+        }
+        self.stats.promoted_blocks += reads;
+        pinned
+    }
+
+    /// A filled promotion becomes the block's new home.
+    fn publish(&mut self, promotion: Promotion) -> PinnedBlock {
+        let slot = promotion.writer.slot();
+        self.index.set_place(promotion.hash, Place::Ram(slot));
+        if let Some(disk) = self.disk.as_mut() {
+            disk.free(promotion.disk_slot);
+        }
+        self.reprice(promotion.hash);
+        self.slab.pinned(promotion.hash, slot)
+    }
+
+    /// Give back what a promotion reserved. The block stays on disk.
+    fn abandon(&mut self, promotion: Promotion) {
+        self.slab.free(promotion.writer.slot());
+        self.index.unpin(promotion.hash);
+    }
+
+    pub fn disk_reader(&self) -> Option<DiskReader> {
+        self.disk.as_ref().map(DiskTier::reader)
     }
 
     pub fn unpin_all(&mut self, blocks: &[PinnedBlock]) {

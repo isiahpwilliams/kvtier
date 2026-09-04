@@ -1,9 +1,12 @@
 //! TCP server over a `KvStore`.
 //!
 //! `GetBlocks` writes block bytes from the slab straight to the socket, with
-//! no staging buffer. The slice is borrowed from the slab, so the store lock
-//! is held across the write and clients serialize for its duration --
-//! per-block pinning is what lifts that.
+//! no staging buffer. Pinning is what lets that run unlocked: the store lock
+//! is taken only to reserve the run and again to release it.
+//!
+//! Demoted blocks are read back the same way. The reads are issued in
+//! parallel on the blocking pool, since `MatchPrefix` tells us the whole run
+//! up front -- there is nothing to predict, so nothing is speculative.
 
 use std::io;
 use std::net::SocketAddr;
@@ -19,11 +22,13 @@ use crate::proto::{
     encode_info,
 };
 use crate::slab::PinnedBlock;
-use crate::store::KvStore;
+use crate::store::{FetchPart, KvStore};
+use crate::tier::DiskReader;
 
 pub struct Server {
     listener: TcpListener,
     store: Arc<Mutex<KvStore>>,
+    parallel_reads: usize,
 }
 
 impl Server {
@@ -31,7 +36,15 @@ impl Server {
         Ok(Self {
             listener: TcpListener::bind(addr).await?,
             store,
+            parallel_reads: DEFAULT_PARALLEL_READS,
         })
+    }
+
+    /// How many disk reads to have in flight per fetch. Higher gives the
+    /// drive more to overlap; 1 makes promotions strictly sequential.
+    pub fn with_parallel_reads(mut self, reads: usize) -> Self {
+        self.parallel_reads = reads.max(1);
+        self
     }
 
     /// The bound address. Tests bind port 0 and read the real one back.
@@ -44,8 +57,9 @@ impl Server {
         loop {
             let (socket, peer) = self.listener.accept().await?;
             let store = Arc::clone(&self.store);
+            let parallel_reads = self.parallel_reads;
             tokio::spawn(async move {
-                if let Err(error) = serve_connection(socket, store).await {
+                if let Err(error) = serve_connection(socket, store, parallel_reads).await {
                     eprintln!("connection {peer} ended: {error}");
                 }
             });
@@ -53,7 +67,11 @@ impl Server {
     }
 }
 
-async fn serve_connection(mut socket: TcpStream, store: Arc<Mutex<KvStore>>) -> io::Result<()> {
+async fn serve_connection(
+    mut socket: TcpStream,
+    store: Arc<Mutex<KvStore>>,
+    parallel_reads: usize,
+) -> io::Result<()> {
     // Block payloads are large and responses are already batched, so Nagle
     // buys nothing and its delay would land straight on TTFT.
     socket.set_nodelay(true)?;
@@ -63,7 +81,7 @@ async fn serve_connection(mut socket: TcpStream, store: Arc<Mutex<KvStore>>) -> 
         payload.resize(header.payload_len as usize, 0);
         socket.read_exact(&mut payload).await?;
 
-        if let Err(error) = dispatch(&mut socket, &store, header, &payload).await {
+        if let Err(error) = dispatch(&mut socket, &store, header, &payload, parallel_reads).await {
             // A protocol error is the peer's fault and is recoverable: report
             // it and keep the connection. An I/O error is not.
             match error.downcast::<ProtoError>() {
@@ -92,11 +110,14 @@ async fn dispatch(
     store: &Mutex<KvStore>,
     header: Header,
     payload: &[u8],
+    parallel_reads: usize,
 ) -> io::Result<()> {
     match header.opcode {
         Opcode::Info => handle_info(socket, store, header).await,
         Opcode::MatchPrefix => handle_match_prefix(socket, store, header, payload).await,
-        Opcode::GetBlocks => handle_get_blocks(socket, store, header, payload).await,
+        Opcode::GetBlocks => {
+            handle_get_blocks(socket, store, header, payload, parallel_reads).await
+        }
         Opcode::PutBlocks => handle_put_blocks(socket, store, header, payload).await,
         Opcode::Stats => handle_stats(socket, store, header).await,
         Opcode::Error => Err(ProtoError::BadOpcode(Opcode::Error as u8).into()),
@@ -143,15 +164,24 @@ async fn handle_get_blocks(
     store: &Mutex<KvStore>,
     header: Header,
     payload: &[u8],
+    parallel_reads: usize,
 ) -> io::Result<()> {
     let hashes = read_hash_request(payload)?;
 
-    let (pinned, block_bytes) = {
+    // Reserve the run, then let go of the lock for the slow parts.
+    let (parts, reader, block_bytes) = {
         let mut store = store.lock().await;
         let block_bytes = store.layout().block_bytes();
         let capacity = blocks_per_frame(block_bytes).min(hashes.len());
-        (store.pin_run(&hashes[..capacity]), block_bytes)
+        (
+            store.begin_fetch(&hashes[..capacity]),
+            store.disk_reader(),
+            block_bytes,
+        )
     };
+
+    let parts = fill_from_disk(parts, reader, parallel_reads).await;
+    let pinned = store.lock().await.finish_fetch(parts);
 
     let result = write_blocks(socket, header, &pinned, block_bytes).await;
 
@@ -159,6 +189,61 @@ async fn handle_get_blocks(
     // unevictable for the life of the process.
     store.lock().await.unpin_all(&pinned);
     result
+}
+
+/// Enough queue depth for the drive to overlap requests, without handing the
+/// blocking pool one thread per block.
+pub const DEFAULT_PARALLEL_READS: usize = 8;
+
+/// Fill every demoted block in the run, off the store lock and in parallel.
+///
+/// Stripes rather than one task per block: a long run would otherwise spawn
+/// hundreds of blocking tasks to do work the drive cannot overlap anyway.
+async fn fill_from_disk(
+    parts: Vec<FetchPart>,
+    reader: Option<DiskReader>,
+    parallel_reads: usize,
+) -> Vec<FetchPart> {
+    let Some(reader) = reader else {
+        return parts;
+    };
+    let pending = parts
+        .iter()
+        .filter(|part| matches!(part, FetchPart::Pending(_)))
+        .count();
+    if pending == 0 {
+        return parts;
+    }
+
+    let stripe = parts.len().div_ceil(parallel_reads).max(1);
+    let mut tasks = Vec::new();
+    let mut rest = parts;
+    while !rest.is_empty() {
+        let tail = rest.split_off(stripe.min(rest.len()));
+        let mut chunk = std::mem::replace(&mut rest, tail);
+        let reader = reader.clone();
+
+        tasks.push(tokio::task::spawn_blocking(move || {
+            for part in &mut chunk {
+                if let FetchPart::Pending(promotion) = part {
+                    // A failed read leaves the block unfilled; `finish_fetch`
+                    // truncates the run there rather than serving a hole.
+                    let _ = promotion.fill(&reader);
+                }
+            }
+            chunk
+        }));
+    }
+
+    let mut filled = Vec::new();
+    for task in tasks {
+        match task.await {
+            Ok(chunk) => filled.extend(chunk),
+            // Only reachable if the runtime is shutting down under us.
+            Err(_) => break,
+        }
+    }
+    filled
 }
 
 async fn write_blocks(

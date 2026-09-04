@@ -9,6 +9,7 @@ use kvtier::block::{BlockHash, BlockLayout};
 use kvtier::client::KvClient;
 use kvtier::server::Server;
 use kvtier::store::KvStore;
+use kvtier::tier::DiskTier;
 use kvtier::trace::SplitMix64;
 use tokio::sync::Mutex;
 
@@ -91,6 +92,103 @@ async fn main() -> std::io::Result<()> {
     );
 
     concurrency_sweep(addr, &hashes[..8], block_bytes).await?;
+    cold_fetch_sweep(&layout).await?;
+    Ok(())
+}
+
+/// Cold fetches, where most of the run has to come off disk.
+///
+/// `MatchPrefix` names the whole run before any of it is touched, so the
+/// reads need no prediction -- the only question is how many to have in
+/// flight. Note this reads a file written moments ago, so the page cache is
+/// warm: these numbers bound our own overhead, not the drive's latency.
+async fn cold_fetch_sweep(layout: &BlockLayout) -> std::io::Result<()> {
+    const CHAINS: usize = 8;
+    const PER_CHAIN: usize = 31; // one frame at this block size
+    const ROUNDS: usize = 4;
+
+    let block_bytes = layout.block_bytes();
+    println!("\ncold fetch: {CHAINS} chains x {PER_CHAIN} blocks, 64 blocks of RAM");
+    println!(
+        "{:>10}  {:>10}  {:>10}  {:>12}",
+        "in flight", "ms/fetch", "GB/s", "2 clients"
+    );
+
+    for parallel in [1usize, 4, 8] {
+        let disk = DiskTier::temporary(block_bytes, CHAINS * PER_CHAIN + 16)?;
+        let store = KvStore::new("bench", layout.clone(), 64)?.with_disk_tier(disk);
+        let server = Server::bind("127.0.0.1:0".parse().unwrap(), Arc::new(Mutex::new(store)))
+            .await?
+            .with_parallel_reads(parallel);
+        let addr: SocketAddr = server.local_addr()?;
+        tokio::spawn(server.run());
+
+        let mut client = KvClient::connect(addr).await?;
+        let payload = vec![0xCDu8; block_bytes];
+
+        // Independent chains, so fetching one pushes the others to disk.
+        let mut chains = Vec::new();
+        let mut rng = SplitMix64::new(parallel as u64);
+        for _ in 0..CHAINS {
+            let mut hashes = Vec::new();
+            let mut parent = None;
+            for depth in 0..PER_CHAIN {
+                let mut bytes = [0u8; 16];
+                bytes[..8].copy_from_slice(&rng.next_u64().to_le_bytes());
+                bytes[8..].copy_from_slice(&rng.next_u64().to_le_bytes());
+                let hash = BlockHash::from_bytes(bytes);
+
+                let names = [(hash, ((depth + 1) * layout.tokens_per_block) as u32)];
+                client.put_blocks(parent, &names, &[&payload]).await?;
+                parent = Some(hash);
+                hashes.push(hash);
+            }
+            chains.push(hashes);
+        }
+
+        // One client at a time: does queue depth help the drive?
+        let start = Instant::now();
+        for _ in 0..ROUNDS {
+            for chain in &chains {
+                let blocks = client.get_blocks(chain).await?;
+                assert_eq!(blocks.len(), PER_CHAIN);
+            }
+        }
+        let elapsed = start.elapsed();
+
+        // Several clients at once: is the store lock still held across the
+        // read? If it were, this would not move. Kept to two clients because
+        // a fetch reserves a RAM slot per demoted block, and more than that
+        // would not fit -- the runs would come back truncated and the number
+        // would be measuring bytes that never moved.
+        let concurrent = Instant::now();
+        let mut tasks = Vec::new();
+        for chain in chains.iter().take(2) {
+            let chain = chain.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut client = KvClient::connect(addr).await.unwrap();
+                let mut blocks = 0usize;
+                for _ in 0..ROUNDS {
+                    blocks += client.get_blocks(&chain).await.unwrap().len();
+                }
+                blocks
+            }));
+        }
+        let mut moved = 0usize;
+        for task in tasks {
+            moved += task.await.unwrap();
+        }
+        let concurrent = concurrent.elapsed();
+
+        let fetches = (ROUNDS * CHAINS) as f64;
+        let total = fetches * (PER_CHAIN * block_bytes) as f64;
+        println!(
+            "{parallel:>10}  {:>10.1}  {:>10.2}  {:>12.2}",
+            elapsed.as_secs_f64() * 1000.0 / fetches,
+            total / elapsed.as_secs_f64() / 1e9,
+            (moved * block_bytes) as f64 / concurrent.as_secs_f64() / 1e9
+        );
+    }
     Ok(())
 }
 

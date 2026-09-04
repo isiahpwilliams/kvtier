@@ -190,3 +190,98 @@ fn a_tiered_store_holds_far_more_than_its_ram() {
     assert_eq!(store.disk_blocks(), 192);
     assert_eq!(store.stats().evicted_blocks, 0, "nothing needed dropping");
 }
+
+#[test]
+fn a_fetch_reserves_then_publishes() {
+    let mut store = tiered(4, 32);
+    let admitted = overfill(&mut store, 7);
+    let off_ram = demoted(&store, &admitted);
+    assert!(!off_ram.is_empty());
+
+    // Phase one: no I/O has happened, so the block is still on disk.
+    let mut parts = store.begin_fetch(&off_ram);
+    assert_eq!(parts.len(), off_ram.len());
+    assert_eq!(store.disk_stats().unwrap().reads, 0);
+
+    // Phase two, which the server runs with the lock released.
+    let reader = store.disk_reader().unwrap();
+    for part in &mut parts {
+        if let kvtier::store::FetchPart::Pending(promotion) = part {
+            promotion.fill(&reader).unwrap();
+        }
+    }
+
+    // Phase three: publish and hand back the run.
+    let pinned = store.finish_fetch(parts);
+    assert_eq!(pinned.len(), off_ram.len());
+    for block in &pinned {
+        assert_eq!(block.bytes(), expected(&store, block.hash()).as_slice());
+    }
+    store.unpin_all(&pinned);
+    assert_eq!(store.stats().promoted_blocks as usize, off_ram.len());
+}
+
+#[test]
+fn an_unfilled_block_truncates_the_run_instead_of_serving_a_hole() {
+    let mut store = tiered(4, 32);
+    let admitted = overfill(&mut store, 7);
+    let off_ram = demoted(&store, &admitted);
+    assert!(off_ram.len() >= 2);
+
+    // Fill everything except the first demoted block, as a failed read would.
+    let reader = store.disk_reader().unwrap();
+    let mut parts = store.begin_fetch(&off_ram);
+    let mut seen_pending = false;
+    for part in &mut parts {
+        if let kvtier::store::FetchPart::Pending(promotion) = part {
+            if seen_pending {
+                promotion.fill(&reader).unwrap();
+            }
+            seen_pending = true;
+        }
+    }
+
+    let pinned = store.finish_fetch(parts);
+    assert!(
+        pinned.len() < off_ram.len(),
+        "the run must stop at the hole"
+    );
+    store.unpin_all(&pinned);
+
+    // Everything reserved was given back: no leaked pins, no leaked slots.
+    assert_eq!(store.resident_blocks(), 7);
+    for &hash in &admitted {
+        assert!(store.contains(hash));
+    }
+}
+
+#[test]
+fn a_block_being_read_cannot_be_evicted_underneath() {
+    let mut store = tiered(4, 8);
+    let admitted = overfill(&mut store, 6);
+    let off_ram = demoted(&store, &admitted);
+
+    // Reserve the run, then pile on pressure before the reads land.
+    let mut parts = store.begin_fetch(&off_ram);
+    for seed in 100..120 {
+        admit_leaf(&mut store, seed, 16);
+    }
+
+    let reader = store.disk_reader().unwrap();
+    for part in &mut parts {
+        if let kvtier::store::FetchPart::Pending(promotion) = part {
+            promotion.fill(&reader).unwrap();
+        }
+    }
+
+    let pinned = store.finish_fetch(parts);
+    assert_eq!(
+        pinned.len(),
+        off_ram.len(),
+        "pins held through the pressure"
+    );
+    for block in &pinned {
+        assert_eq!(block.bytes(), expected(&store, block.hash()).as_slice());
+    }
+    store.unpin_all(&pinned);
+}

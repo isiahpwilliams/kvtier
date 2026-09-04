@@ -108,6 +108,25 @@ impl PinnedBlock {
     }
 }
 
+/// A slot reserved but not yet published in the index, so nothing can read
+/// it. That is what makes it safe to fill outside the store lock.
+pub struct BlockWriter {
+    memory: Arc<SlabMemory>,
+    slot: SlotId,
+}
+
+impl BlockWriter {
+    pub fn slot(&self) -> SlotId {
+        self.slot
+    }
+
+    pub fn bytes_mut(&mut self) -> &mut [u8] {
+        // SAFETY: the slot is allocated and absent from the index, so no
+        // reader can name it, and `&mut self` rules out a second writer.
+        unsafe { self.memory.block_mut(self.slot) }
+    }
+}
+
 pub struct Slab {
     memory: Arc<SlabMemory>,
     /// Free slots, LIFO: the last-freed slot is still cache-hot.
@@ -159,6 +178,15 @@ impl Slab {
         // `Slab`. Callers must not have published the slot yet, or a
         // `PinnedBlock` could be reading it.
         unsafe { self.memory.block_mut(slot) }
+    }
+
+    /// Hand out a reserved slot for filling outside the lock. The caller must
+    /// not publish `slot` in the index until the writer is done with it.
+    pub fn writer(&self, slot: SlotId) -> BlockWriter {
+        BlockWriter {
+            memory: Arc::clone(&self.memory),
+            slot,
+        }
     }
 
     /// Hold a slot open for reading past the lifetime of a `&self` borrow.

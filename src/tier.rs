@@ -6,6 +6,7 @@ use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -73,8 +74,30 @@ impl TierCosts {
     }
 }
 
+/// A read-only handle on the tier's file, detachable from the store.
+///
+/// Positional reads take `&self`, so clones of this can run concurrently on a
+/// blocking pool while the store lock is free.
+#[derive(Clone)]
+pub struct DiskReader {
+    file: Arc<File>,
+    block_bytes: usize,
+}
+
+impl DiskReader {
+    pub fn read(&self, slot: DiskSlot, into: &mut [u8]) -> io::Result<()> {
+        assert_eq!(
+            into.len(),
+            self.block_bytes,
+            "destination must be one block"
+        );
+        self.file
+            .read_exact_at(into, (slot.index() * self.block_bytes) as u64)
+    }
+}
+
 pub struct DiskTier {
-    file: File,
+    file: Arc<File>,
     path: PathBuf,
     /// Unlinked at creation, so the backing file disappears with the process.
     unlinked: bool,
@@ -103,7 +126,7 @@ impl DiskTier {
         file.set_len((block_bytes * capacity) as u64)?;
 
         Ok(Self {
-            file,
+            file: Arc::new(file),
             path: path.to_path_buf(),
             unlinked: false,
             block_bytes,
@@ -160,15 +183,41 @@ impl DiskTier {
     }
 
     pub fn read_block(&mut self, slot: DiskSlot, into: &mut [u8]) -> io::Result<()> {
-        assert_eq!(
-            into.len(),
-            self.block_bytes,
-            "destination must be one block"
-        );
-        self.file.read_exact_at(into, self.offset(slot))?;
-        self.stats.reads += 1;
-        self.stats.bytes_read += into.len() as u64;
+        self.reader().read(slot, into)?;
+        self.note_reads(1, into.len() as u64);
         Ok(())
+    }
+
+    /// Ask the kernel to stop caching this file, so reads reach the drive.
+    ///
+    /// Returns whether it took effect. Benchmarks need it -- a file written
+    /// moments ago is entirely in the page cache, which turns a disk read
+    /// into a memcpy and hides everything worth measuring. Call it before the
+    /// first write, so those do not populate the cache either.
+    pub fn try_bypass_page_cache(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is owned by this struct and open.
+            unsafe { libc::fcntl(self.file.as_raw_fd(), libc::F_NOCACHE, 1) != -1 }
+        }
+        // Linux would need O_DIRECT, whose alignment rules reach further than
+        // a benchmark switch should.
+        #[cfg(not(target_os = "macos"))]
+        false
+    }
+
+    pub fn reader(&self) -> DiskReader {
+        DiskReader {
+            file: Arc::clone(&self.file),
+            block_bytes: self.block_bytes,
+        }
+    }
+
+    /// Account for reads issued through a detached `DiskReader`.
+    pub fn note_reads(&mut self, count: u64, bytes: u64) {
+        self.stats.reads += count;
+        self.stats.bytes_read += bytes;
     }
 
     pub fn block_bytes(&self) -> usize {

@@ -371,3 +371,42 @@ async fn pins_are_released_after_a_fetch() {
         "the tail block must be evictable again once the transfer is done"
     );
 }
+
+#[tokio::test]
+async fn a_client_fetching_demoted_blocks_gets_the_right_bytes() {
+    // The server reads them back off disk, in parallel, with the store lock
+    // released. The client should not be able to tell.
+    let layout = BlockLayout::tiny();
+    let disk = kvtier::tier::DiskTier::temporary(layout.block_bytes(), 256).unwrap();
+    let store = Arc::new(Mutex::new(
+        KvStore::new("test-model", layout, 4)
+            .unwrap()
+            .with_disk_tier(disk),
+    ));
+    let server = Server::bind("127.0.0.1:0".parse().unwrap(), Arc::clone(&store))
+        .await
+        .unwrap();
+    let addr = server.local_addr().unwrap();
+    tokio::spawn(server.run());
+
+    let mut client = KvClient::connect(addr).await.unwrap();
+    let mut written = Vec::new();
+    for seed in 0..12u64 {
+        let (names, payloads) = sequence(&tokens(64, 700 + seed));
+        let refs: Vec<&[u8]> = payloads.iter().map(|p| p.as_slice()).collect();
+        client.put_blocks(None, &names, &refs).await.unwrap();
+        written.push((
+            names.iter().map(|&(hash, _)| hash).collect::<Vec<_>>(),
+            payloads,
+        ));
+    }
+
+    // Only 4 blocks fit in RAM, so most of this comes off disk.
+    for (hashes, payloads) in &written {
+        assert_eq!(client.get_blocks(hashes).await.unwrap(), *payloads);
+    }
+
+    let (stats, resident) = client.stats().await.unwrap();
+    assert_eq!(resident, 48, "nothing was dropped");
+    assert!(stats.promoted_blocks > 0, "blocks came back off disk");
+}
