@@ -79,6 +79,45 @@ impl DType {
     }
 }
 
+/// How a block's bytes are ordered inside its flat chunk.
+///
+/// The dimensions alone do not pin this down: two connectors can agree on
+/// every field of `BlockLayout` and still write the same bytes in a different
+/// order. So the order feeds the namespace digest, and a connector that
+/// serializes differently misses rather than returning another order's bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BlockOrder {
+    /// vLLM's NHD paged layout with K and V packed into the content dim:
+    /// layer -> token -> head -> K then V -> head_dim. One contiguous range
+    /// per (layer, block), which is why it is the cheapest order to move.
+    #[default]
+    VllmNhd,
+}
+
+impl BlockOrder {
+    pub const fn tag(self) -> &'static str {
+        match self {
+            BlockOrder::VllmNhd => "vllm-nhd-kvpacked-layer-major-v1",
+        }
+    }
+}
+
+/// Which tensor-parallel shard a block holds, under per-rank sharding.
+///
+/// Ranks share one server but hold different heads, so the rank belongs in
+/// the namespace rather than in the layout: same server, disjoint names.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Shard {
+    pub rank: u32,
+    pub count: u32,
+}
+
+impl Default for Shard {
+    fn default() -> Self {
+        Self { rank: 0, count: 1 }
+    }
+}
+
 /// The physical shape of one block. Every field changes the byte layout, so
 /// every field feeds into the namespace digest.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -146,6 +185,10 @@ pub struct PrefixHasher {
 
 impl PrefixHasher {
     pub fn new(model_id: &str, layout: &BlockLayout) -> Self {
+        Self::sharded(model_id, layout, BlockOrder::default(), Shard::default())
+    }
+
+    pub fn sharded(model_id: &str, layout: &BlockLayout, order: BlockOrder, shard: Shard) -> Self {
         let mut hasher = blake3::Hasher::new();
         hasher.update(&[TAG_NAMESPACE]);
         // Length-prefixed so ("ab","c") and ("a","bc") hash differently.
@@ -156,6 +199,10 @@ impl PrefixHasher {
         hasher.update(&(layout.num_kv_heads as u64).to_le_bytes());
         hasher.update(&(layout.head_dim as u64).to_le_bytes());
         hasher.update(layout.dtype.name().as_bytes());
+        hasher.update(&(order.tag().len() as u64).to_le_bytes());
+        hasher.update(order.tag().as_bytes());
+        hasher.update(&shard.rank.to_le_bytes());
+        hasher.update(&shard.count.to_le_bytes());
         Self {
             namespace: truncate(hasher.finalize()),
             tokens_per_block: layout.tokens_per_block,
@@ -325,5 +372,36 @@ mod tests {
         assert_eq!(hasher.chain(&seq(40)).len(), 2);
         // Names stay stable as the tail grows.
         assert_eq!(hasher.chain(&seq(40)), hasher.chain(&seq(47))[..2]);
+    }
+
+    #[test]
+    fn tp_ranks_never_collide() {
+        // Per-rank shards: same tokens, same layout, different heads. Sharing
+        // a name here would hand a rank another rank's heads.
+        let layout = BlockLayout::tiny();
+        let order = BlockOrder::default();
+        let zero = PrefixHasher::sharded("m", &layout, order, Shard { rank: 0, count: 2 });
+        let one = PrefixHasher::sharded("m", &layout, order, Shard { rank: 1, count: 2 });
+        assert_ne!(zero.chain(&seq(32)), one.chain(&seq(32)));
+    }
+
+    #[test]
+    fn tp_degree_is_part_of_the_namespace() {
+        // Rank 0 of 2 holds different heads than rank 0 of 4.
+        let layout = BlockLayout::tiny();
+        let order = BlockOrder::default();
+        let two = PrefixHasher::sharded("m", &layout, order, Shard { rank: 0, count: 2 });
+        let four = PrefixHasher::sharded("m", &layout, order, Shard { rank: 0, count: 4 });
+        assert_ne!(two.chain(&seq(32)), four.chain(&seq(32)));
+    }
+
+    #[test]
+    fn the_default_hasher_is_the_unsharded_one() {
+        let layout = BlockLayout::tiny();
+        assert_eq!(
+            PrefixHasher::new("m", &layout).chain(&seq(32)),
+            PrefixHasher::sharded("m", &layout, BlockOrder::default(), Shard::default())
+                .chain(&seq(32)),
+        );
     }
 }

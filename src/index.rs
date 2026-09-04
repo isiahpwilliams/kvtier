@@ -115,6 +115,10 @@ pub struct Entry {
     pub pins: u32,
     /// Logical clock value at last hit.
     pub last_access: u64,
+    /// `last_access` as of the last `set_priority`. A pin bumps `last_access`
+    /// without repricing, so this -- not `last_access` -- is what a heap
+    /// candidate can be checked against.
+    pub priority_access: u64,
     /// Eviction priority, owned by `evict`. Stored here so a candidate popped
     /// from the policy's heap can be checked against the block's live value.
     pub priority: f64,
@@ -196,6 +200,7 @@ impl Index {
                 depth_tokens,
                 pins: 0,
                 last_access: self.clock,
+                priority_access: self.clock,
                 priority: 0.0,
             },
         );
@@ -227,6 +232,7 @@ impl Index {
     pub fn set_priority(&mut self, hash: BlockHash, priority: f64) {
         if let Some(entry) = self.entries.get_mut(&hash) {
             entry.priority = priority;
+            entry.priority_access = entry.last_access;
         }
     }
 

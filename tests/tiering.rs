@@ -171,10 +171,21 @@ fn a_full_disk_drops_its_cheapest_leaf() {
 fn a_promoted_block_can_be_demoted_again() {
     let mut store = tiered(2, 8);
     let kept = admit_leaf(&mut store, 1, 16);
+    let mut seed = 100;
 
-    for round in 0..6 {
-        admit_leaf(&mut store, 100 + round, 16);
-        // Every round pulls it back into RAM, and the next admit pushes it out.
+    for round in 0..3 {
+        // Let it go cold first: one admit per round would leave it the most
+        // recently used block in RAM, and it would never leave.
+        for _ in 0..3 {
+            admit_leaf(&mut store, seed, 16);
+            seed += 1;
+        }
+        assert!(
+            store.read(kept).is_none(),
+            "should be on disk by round {round}"
+        );
+
+        // The pin pulls it back, and the next round pushes it out again.
         let pinned = store.pin_run(&[kept]);
         assert_eq!(pinned.len(), 1, "still reachable on round {round}");
         assert_eq!(pinned[0].bytes(), expected(&store, kept).as_slice());
@@ -182,7 +193,7 @@ fn a_promoted_block_can_be_demoted_again() {
     }
 
     let stats = store.stats();
-    assert!(stats.promoted_blocks >= 1 && stats.demoted_blocks >= 2);
+    assert!(stats.promoted_blocks >= 2 && stats.demoted_blocks >= 2);
     assert!(store.contains(kept));
 }
 

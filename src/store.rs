@@ -280,8 +280,10 @@ impl KvStore {
         };
 
         let priority = policy.priority_for(entry.depth_tokens);
-        policy.offer(hash, priority);
+        policy.offer(hash, priority, entry.last_access);
         let crowded = policy.should_compact(self.index.len());
+        // Stamps `priority_access` from `last_access`, matching what was
+        // just offered.
         self.index.set_priority(hash, priority);
 
         if crowded {

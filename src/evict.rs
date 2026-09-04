@@ -47,9 +47,16 @@ impl Default for CostModel {
 
 /// Heap entry. Positive finite floats order the same as their IEEE bit
 /// patterns, so sorting on `u64` gives `Ord` without a wrapper type.
+///
+/// `access` is not decoration. Blocks at a similar depth cost the same to
+/// rebuild, so `L + cost` collides bit-for-bit across a whole slab and the
+/// derived ordering falls through to the next field. Least-recently-used is
+/// the tiebreak GreedyDual assumes; the hash is only there to make the order
+/// total.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Candidate {
     key: u64,
+    access: u64,
     hash: BlockHash,
 }
 
@@ -89,11 +96,18 @@ impl GreedyDual {
         self.inflation + self.cost.recompute_cost(depth_tokens)
     }
 
-    pub fn offer(&mut self, hash: BlockHash, priority: f64) {
+    pub fn offer(&mut self, hash: BlockHash, priority: f64, access: u64) {
         self.heap.push(Reverse(Candidate {
             key: key(priority),
+            access,
             hash,
         }));
+    }
+
+    /// A candidate is stale once the block has been repriced again. Priority
+    /// alone cannot detect that: a reprice often lands on the same number.
+    fn is_stale(candidate: &Candidate, entry: &Entry) -> bool {
+        key(entry.priority) != candidate.key || entry.priority_access != candidate.access
     }
 
     /// The cheapest block worth giving up, or `None` if nothing is eligible.
@@ -114,7 +128,7 @@ impl GreedyDual {
             let Some(entry) = index.get(candidate.hash) else {
                 continue; // already gone
             };
-            if key(entry.priority) != candidate.key {
+            if Self::is_stale(&candidate, entry) {
                 continue; // touched since; a fresher candidate is in the heap
             }
             // A pin is temporary and carries no reprice when it lifts, so
@@ -156,7 +170,7 @@ impl GreedyDual {
             let Some(entry) = index.get(candidate.hash) else {
                 continue; // gone
             };
-            if key(entry.priority) != candidate.key {
+            if Self::is_stale(&candidate, entry) {
                 continue; // stale
             }
             if entry.pins == 0 && accept(entry) {
@@ -194,6 +208,7 @@ impl GreedyDual {
         for (hash, entry) in index.iter().filter(|(_, e)| e.pins == 0 && accept(e)) {
             self.heap.push(Reverse(Candidate {
                 key: key(entry.priority),
+                access: entry.priority_access,
                 hash,
             }));
         }
