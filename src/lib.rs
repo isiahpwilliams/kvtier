@@ -12,6 +12,7 @@ pub mod proto;
 pub mod server;
 pub mod slab;
 pub mod store;
+pub mod tier;
 pub mod trace;
 
 pub use block::{BlockHash, BlockLayout, DType, PrefixHasher, TokenId};

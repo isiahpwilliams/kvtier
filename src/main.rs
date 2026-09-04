@@ -3,6 +3,7 @@
 
 use kvtier::block::BlockLayout;
 use kvtier::store::{KvStore, Stats};
+use kvtier::tier::DiskTier;
 use kvtier::trace::{self, Request, WorkloadConfig};
 
 struct Run {
@@ -10,16 +11,28 @@ struct Run {
     total_tokens: usize,
     resident: usize,
     stats: Stats,
+    disk_reads: u64,
     per_turn: Vec<(usize, usize)>,
 }
 
-fn run(requests: &[Request], layout: &BlockLayout, capacity: usize, turns: usize) -> Run {
+fn run(
+    requests: &[Request],
+    layout: &BlockLayout,
+    capacity: usize,
+    disk_blocks: usize,
+    turns: usize,
+) -> Run {
     let mut store = KvStore::new("llama-3-8b", layout.clone(), capacity).unwrap();
+    if disk_blocks > 0 {
+        let tier = DiskTier::temporary(layout.block_bytes(), disk_blocks).unwrap();
+        store = store.with_disk_tier(tier);
+    }
     let mut result = Run {
         hit_tokens: 0,
         total_tokens: 0,
         resident: 0,
         stats: Stats::default(),
+        disk_reads: 0,
         per_turn: vec![(0, 0); turns],
     };
 
@@ -29,6 +42,11 @@ fn run(requests: &[Request], layout: &BlockLayout, capacity: usize, turns: usize
         result.total_tokens += request.tokens.len();
         result.per_turn[request.turn].0 += lookup.hit_tokens();
         result.per_turn[request.turn].1 += request.tokens.len();
+
+        // The engine fetches what it hit, which is what pulls demoted blocks
+        // back off disk. Skipping this would make tiering look free.
+        let pinned = store.pin_run(&lookup.hashes[..lookup.matched]);
+        store.unpin_all(&pinned);
 
         // At the end of a request the engine hands back the generated KV too.
         let completed = store.lookup(&request.completed);
@@ -43,6 +61,7 @@ fn run(requests: &[Request], layout: &BlockLayout, capacity: usize, turns: usize
 
     result.resident = store.resident_blocks();
     result.stats = store.stats();
+    result.disk_reads = store.disk_stats().map_or(0, |disk| disk.reads);
     result
 }
 
@@ -65,7 +84,7 @@ fn main() -> std::io::Result<()> {
         real_layout.tokens_per_block
     );
 
-    let unbounded = run(&requests, &layout, 8192, config.turns_per_conversation);
+    let unbounded = run(&requests, &layout, 8192, 0, config.turns_per_conversation);
 
     println!(
         "{:>5}  {:>12}  {:>12}  {:>9}",
@@ -98,17 +117,36 @@ fn main() -> std::io::Result<()> {
         unbounded.resident
     );
     println!(
-        "{:>8}  {:>9}  {:>10}  {:>9}  {:>10}",
-        "blocks", "of w.set", "hit rate", "evicted", "GiB served"
+        "{:>7}  {:>8}  {:>8}  {:>10}  {:>8}  {:>9}  {:>9}",
+        "ram", "of w.set", "hit rate", "+disk tier", "dropped", "demoted", "disk read"
     );
     for fraction in [100, 75, 50, 25, 10, 5] {
         let capacity = (unbounded.resident * fraction / 100).max(8);
-        let result = run(&requests, &layout, capacity, config.turns_per_conversation);
+        let flat = run(
+            &requests,
+            &layout,
+            capacity,
+            0,
+            config.turns_per_conversation,
+        );
+        // Disk sized to hold the rest of the working set.
+        let tiered = run(
+            &requests,
+            &layout,
+            capacity,
+            unbounded.resident,
+            config.turns_per_conversation,
+        );
+
         println!(
-            "{capacity:>8}  {fraction:>8}%  {:>8.1}%  {:>9}  {:>10.2}",
-            100.0 * result.hit_tokens as f64 / result.total_tokens as f64,
-            result.stats.evicted_blocks,
-            (result.hit_tokens * real_layout.token_bytes()) as f64 / (1024.0 * 1024.0 * 1024.0)
+            "{capacity:>7}  {fraction:>7}%  {:>7.1}%  {:>9.1}%  {:>8}  {:>9}  {:>8.2} GiB",
+            100.0 * flat.hit_tokens as f64 / flat.total_tokens as f64,
+            100.0 * tiered.hit_tokens as f64 / tiered.total_tokens as f64,
+            tiered.stats.evicted_blocks,
+            tiered.stats.demoted_blocks,
+            // Priced at Llama-3-8B's real block size, like everything else.
+            (tiered.disk_reads * real_layout.block_bytes() as u64) as f64
+                / (1024.0 * 1024.0 * 1024.0)
         );
     }
 

@@ -14,7 +14,7 @@ use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
 use crate::block::BlockHash;
-use crate::index::Index;
+use crate::index::{Entry, Index};
 
 /// What it costs to recompute one block, given its prefix is still cached,
 /// in units where a block at depth zero costs 1.
@@ -105,6 +105,7 @@ impl GreedyDual {
         &mut self,
         index: &Index,
         protect: Option<BlockHash>,
+        accept: impl Fn(&Entry) -> bool,
     ) -> Option<(BlockHash, f64)> {
         let mut deferred = Vec::new();
         let mut victim = None;
@@ -116,8 +117,8 @@ impl GreedyDual {
             if key(entry.priority) != candidate.key {
                 continue; // touched since; a fresher candidate is in the heap
             }
-            if entry.children > 0 || entry.pins > 0 {
-                continue; // re-offered when it becomes a leaf again
+            if entry.pins > 0 || !accept(entry) {
+                continue; // re-offered when it next qualifies
             }
             if Some(candidate.hash) == protect {
                 deferred.push(Reverse(candidate));
@@ -150,9 +151,9 @@ impl GreedyDual {
         self.heap.len() > 64 && self.heap.len() > 4 * resident_blocks.max(1)
     }
 
-    pub fn compact(&mut self, index: &Index) {
+    pub fn compact(&mut self, index: &Index, accept: impl Fn(&Entry) -> bool) {
         self.heap.clear();
-        for (hash, entry) in index.leaves() {
+        for (hash, entry) in index.iter().filter(|(_, e)| e.pins == 0 && accept(e)) {
             self.heap.push(Reverse(Candidate {
                 key: key(entry.priority),
                 hash,

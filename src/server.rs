@@ -238,6 +238,8 @@ async fn handle_stats(
         .u64(stats.deduped_blocks)
         .u64(stats.rejected_blocks)
         .u64(stats.evicted_blocks)
+        .u64(stats.demoted_blocks)
+        .u64(stats.promoted_blocks)
         .u64(stats.bytes_admitted)
         .u64(resident as u64);
     respond(socket, header, &writer.finish()).await

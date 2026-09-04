@@ -5,8 +5,9 @@ use std::io;
 
 use crate::block::{BlockHash, BlockLayout, PrefixHasher, TokenId};
 use crate::evict::{CostModel, GreedyDual};
-use crate::index::Index;
+use crate::index::{Index, Place};
 use crate::slab::{PinnedBlock, Slab};
+use crate::tier::{DiskStats, DiskTier, TierCosts};
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Stats {
@@ -21,7 +22,12 @@ pub struct Stats {
     pub deduped_blocks: u64,
     /// Admits refused: the slab was full and nothing was worth displacing.
     pub rejected_blocks: u64,
+    /// Blocks removed from the cache entirely.
     pub evicted_blocks: u64,
+    /// Blocks pushed from RAM to disk rather than dropped.
+    pub demoted_blocks: u64,
+    /// Blocks read back from disk on a hit.
+    pub promoted_blocks: u64,
     pub bytes_admitted: u64,
 }
 
@@ -86,7 +92,13 @@ pub struct KvStore {
     hasher: PrefixHasher,
     slab: Slab,
     index: Index,
-    policy: GreedyDual,
+    disk: Option<DiskTier>,
+    /// One clock per tier: a block's standing in RAM says nothing about its
+    /// standing among the blocks already on disk.
+    ram_policy: GreedyDual,
+    disk_policy: GreedyDual,
+    tier_costs: TierCosts,
+    cost: CostModel,
     stats: Stats,
 }
 
@@ -100,15 +112,45 @@ impl KvStore {
             hasher,
             slab,
             index: Index::new(),
-            policy: GreedyDual::default(),
+            disk: None,
+            ram_policy: GreedyDual::default(),
+            disk_policy: GreedyDual::default(),
+            tier_costs: TierCosts::default(),
+            cost: CostModel::default(),
             stats: Stats::default(),
         })
     }
 
     /// Replace the recompute cost model, which is per-model.
     pub fn with_cost_model(mut self, cost: CostModel) -> Self {
-        self.policy = GreedyDual::new(cost);
+        self.cost = cost;
+        self.ram_policy = GreedyDual::new(cost);
+        self.disk_policy = GreedyDual::new(cost);
         self
+    }
+
+    /// Attach a disk tier. Without one, eviction means deletion.
+    pub fn with_disk_tier(mut self, tier: DiskTier) -> Self {
+        assert_eq!(
+            tier.block_bytes(),
+            self.layout.block_bytes(),
+            "disk tier block size must match the layout"
+        );
+        self.disk = Some(tier);
+        self
+    }
+
+    pub fn with_tier_costs(mut self, costs: TierCosts) -> Self {
+        self.tier_costs = costs;
+        self
+    }
+
+    pub fn disk_stats(&self) -> Option<DiskStats> {
+        self.disk.as_ref().map(DiskTier::stats)
+    }
+
+    pub fn disk_blocks(&self) -> usize {
+        self.disk.as_ref().map_or(0, DiskTier::live)
     }
 
     pub fn model_id(&self) -> &str {
@@ -131,7 +173,7 @@ impl KvStore {
     /// Blocks the policy is currently tracking as eviction candidates,
     /// including stale entries awaiting compaction.
     pub fn eviction_candidates(&self) -> usize {
-        self.policy.candidates()
+        self.ram_policy.candidates() + self.disk_policy.candidates()
     }
 
     pub fn resident_blocks(&self) -> usize {
@@ -172,26 +214,41 @@ impl KvStore {
     /// Raise a block's eviction priority to reflect having just been used,
     /// and re-offer it to the policy at its new value.
     fn reprice(&mut self, hash: BlockHash) {
-        let Some(depth) = self.index.get(hash).map(|entry| entry.depth_tokens) else {
+        let Some(entry) = self.index.get(hash).copied() else {
             return;
         };
-        let priority = self.policy.priority_for(depth);
+        let in_ram = entry.place.is_ram();
+        let policy = if in_ram {
+            &mut self.ram_policy
+        } else {
+            &mut self.disk_policy
+        };
+
+        let priority = policy.priority_for(entry.depth_tokens);
+        policy.offer(hash, priority);
+        let crowded = policy.should_compact(self.index.len());
         self.index.set_priority(hash, priority);
 
-        // Only leaves are ever eviction candidates, so offering an internal
-        // block would just add a heap entry that always gets skipped.
-        if self.index.get(hash).is_some_and(|e| e.children == 0) {
-            self.policy.offer(hash, priority);
-            if self.policy.should_compact(self.index.len()) {
-                self.policy.compact(&self.index);
+        if crowded {
+            let index = &self.index;
+            if in_ram {
+                self.ram_policy.compact(index, |e| e.place.is_ram());
+            } else {
+                self.disk_policy.compact(index, |e| !e.place.is_ram());
             }
         }
     }
 
-    /// Borrow a resident block's bytes.
+    /// Borrow a block's bytes, if it is in RAM. A demoted block reads as
+    /// `None` here; `pin_run` promotes it first.
     pub fn read(&self, hash: BlockHash) -> Option<&[u8]> {
-        let slot = self.index.get(hash)?.slot;
+        let slot = self.index.get(hash)?.place.ram()?;
         Some(self.slab.block(slot))
+    }
+
+    /// Whether the cache holds this block at all, in either tier.
+    pub fn contains(&self, hash: BlockHash) -> bool {
+        self.index.contains(hash)
     }
 
     /// Hold the resident leading run of `hashes` open for reading.
@@ -203,7 +260,14 @@ impl KvStore {
     pub fn pin_run(&mut self, hashes: &[BlockHash]) -> Vec<PinnedBlock> {
         let mut pinned = Vec::with_capacity(hashes.len());
         for &hash in hashes {
-            match self.index.pin(hash) {
+            // A demoted block has to come back to RAM before its bytes can be
+            // borrowed. Failing that, the run ends here.
+            if self.index.get(hash).is_some_and(|e| !e.place.is_ram())
+                && self.promote(hash).is_err()
+            {
+                break;
+            }
+            match self.index.pin(hash).and_then(Place::ram) {
                 Some(slot) => {
                     pinned.push(self.slab.pinned(hash, slot));
                     self.reprice(hash);
@@ -264,7 +328,7 @@ impl KvStore {
 
         self.slab.block_mut(slot).copy_from_slice(data);
         self.index
-            .insert(hash, parent, slot, depth_tokens)
+            .insert(hash, parent, Place::Ram(slot), depth_tokens)
             .expect("residency and duplication were checked above");
         self.reprice(hash);
 
@@ -279,29 +343,130 @@ impl KvStore {
     /// are admitting lands, which makes it the most attractive victim in the
     /// store -- and evicting it would orphan the very block we came to insert.
     fn make_room(&mut self, parent: Option<BlockHash>) -> Result<(), Admit> {
-        let Some((victim, priority)) = self.policy.select_victim(&self.index, parent) else {
-            return Err(Admit::OutOfSpace);
-        };
-
         // Always admit once a victim exists, even when the newcomer models
         // as cheaper. Refusing on cost ossifies the cache: new blocks start
         // shallow and lose to the deep tails already resident, so nothing is
         // admitted, nothing evicted, and the clock never rises to break the
         // tie.
-        self.evict(victim, priority);
+        loop {
+            let Some((victim, priority)) =
+                self.ram_policy
+                    .select_victim(&self.index, parent, |e| e.place.is_ram())
+            else {
+                return Err(Admit::OutOfSpace);
+            };
+            let entry = *self.index.get(victim).expect("selected from the index");
+
+            // Demotion beats dropping whenever a read back is cheaper than a
+            // rebuild, and unlike dropping it works on any block: a demoted
+            // parent is still there for its children.
+            if self.worth_demoting(entry.depth_tokens) && self.demote(victim).is_ok() {
+                self.ram_policy.note_eviction(priority);
+                return Ok(());
+            }
+            if entry.children == 0 {
+                self.drop_block(victim, priority);
+                return Ok(());
+            }
+            // An internal block we could not demote is not removable either.
+            // It leaves the heap until its next access or its last child goes.
+        }
+    }
+
+    fn worth_demoting(&self, depth_tokens: u32) -> bool {
+        self.disk.is_some()
+            && self
+                .tier_costs
+                .worth_demoting(&self.cost, &self.layout, depth_tokens)
+    }
+
+    /// Move a block's bytes to disk and free its RAM slot.
+    fn demote(&mut self, hash: BlockHash) -> Result<(), ()> {
+        let Some(slot) = self.index.get(hash).and_then(|e| e.place.ram()) else {
+            return Err(());
+        };
+        if self.disk.as_ref().is_some_and(DiskTier::is_full) {
+            self.make_disk_room()?;
+        }
+
+        let disk = self.disk.as_mut().ok_or(())?;
+        let disk_slot = disk.alloc().ok_or(())?;
+        if disk.write_block(disk_slot, self.slab.block(slot)).is_err() {
+            self.disk.as_mut().expect("checked above").free(disk_slot);
+            return Err(());
+        }
+
+        self.slab.free(slot);
+        self.index.set_place(hash, Place::Disk(disk_slot));
+        self.stats.demoted_blocks += 1;
+        self.reprice(hash);
         Ok(())
     }
 
-    fn evict(&mut self, victim: BlockHash, priority: f64) {
+    /// Read a block back into RAM so its bytes can be borrowed.
+    fn promote(&mut self, hash: BlockHash) -> Result<(), ()> {
+        let Some(disk_slot) = self.index.get(hash).and_then(|e| e.place.disk()) else {
+            return Err(());
+        };
+
+        let slot = match self.slab.alloc() {
+            Some(slot) => slot,
+            // Protect the block we are promoting: it is on disk, so demoting
+            // it again would be a pointless round trip.
+            None => match self.make_room(Some(hash)) {
+                Ok(()) => self.slab.alloc().expect("eviction freed a slot"),
+                Err(_) => return Err(()),
+            },
+        };
+
+        let disk = self.disk.as_mut().ok_or(())?;
+        if disk
+            .read_block(disk_slot, self.slab.block_mut(slot))
+            .is_err()
+        {
+            self.slab.free(slot);
+            return Err(());
+        }
+        disk.free(disk_slot);
+
+        self.index.set_place(hash, Place::Ram(slot));
+        self.stats.promoted_blocks += 1;
+        self.reprice(hash);
+        Ok(())
+    }
+
+    /// Drop the cheapest disk-resident leaf, to make room for a demotion.
+    fn make_disk_room(&mut self) -> Result<(), ()> {
+        let (victim, priority) = self
+            .disk_policy
+            .select_victim(&self.index, None, |e| !e.place.is_ram() && e.children == 0)
+            .ok_or(())?;
+        self.disk_policy.note_eviction(priority);
+        self.remove_block(victim);
+        Ok(())
+    }
+
+    fn drop_block(&mut self, victim: BlockHash, priority: f64) {
+        self.ram_policy.note_eviction(priority);
+        self.remove_block(victim);
+    }
+
+    fn remove_block(&mut self, victim: BlockHash) {
         let entry = self
             .index
             .remove(victim)
             .expect("the policy only offers removable blocks");
-        self.slab.free(entry.slot);
-        self.policy.note_eviction(priority);
+        match entry.place {
+            Place::Ram(slot) => self.slab.free(slot),
+            Place::Disk(slot) => self
+                .disk
+                .as_mut()
+                .expect("a disk block needs a tier")
+                .free(slot),
+        }
         self.stats.evicted_blocks += 1;
 
-        // The parent may have just become a leaf, which makes it a candidate.
+        // The parent may have just become a leaf, which makes it removable.
         if let Some(parent) = entry.parent
             && self.index.get(parent).is_some_and(|e| e.children == 0)
         {

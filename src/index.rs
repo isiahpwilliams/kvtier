@@ -16,6 +16,35 @@ use std::hash::{BuildHasherDefault, Hasher};
 
 use crate::block::BlockHash;
 use crate::slab::SlotId;
+use crate::tier::DiskSlot;
+
+/// Which tier holds a block's bytes. Both count as resident: a hit on a
+/// demoted block is still a hit, it just costs a read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Place {
+    Ram(SlotId),
+    Disk(DiskSlot),
+}
+
+impl Place {
+    pub fn ram(self) -> Option<SlotId> {
+        match self {
+            Place::Ram(slot) => Some(slot),
+            Place::Disk(_) => None,
+        }
+    }
+
+    pub fn disk(self) -> Option<DiskSlot> {
+        match self {
+            Place::Disk(slot) => Some(slot),
+            Place::Ram(_) => None,
+        }
+    }
+
+    pub fn is_ram(self) -> bool {
+        matches!(self, Place::Ram(_))
+    }
+}
 
 /// Passes a `BlockHash`'s bucket key straight through. The keys are already
 /// BLAKE3 digests, so `HashMap`'s default SipHash pass would add no
@@ -44,7 +73,7 @@ type BlockMap<V> = HashMap<BlockHash, V, BuildHasherDefault<IdentityHasher>>;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Entry {
-    pub slot: SlotId,
+    pub place: Place,
     /// `None` for a sequence's first block: its parent is the unstored root.
     pub parent: Option<BlockHash>,
     /// Resident blocks naming this one as parent; only a leaf may be evicted.
@@ -115,7 +144,7 @@ impl Index {
         &mut self,
         hash: BlockHash,
         parent: Option<BlockHash>,
-        slot: SlotId,
+        place: Place,
         depth_tokens: u32,
     ) -> Result<(), IndexError> {
         if self.entries.contains_key(&hash) {
@@ -131,7 +160,7 @@ impl Index {
         self.entries.insert(
             hash,
             Entry {
-                slot,
+                place,
                 parent,
                 children: 0,
                 depth_tokens,
@@ -150,13 +179,19 @@ impl Index {
 
     /// Hold a block open for reading, returning where its bytes are. The
     /// block cannot be removed until the matching `unpin`.
-    pub fn pin(&mut self, hash: BlockHash) -> Option<SlotId> {
+    pub fn pin(&mut self, hash: BlockHash) -> Option<Place> {
         self.clock += 1;
         let clock = self.clock;
         let entry = self.entries.get_mut(&hash)?;
         entry.pins += 1;
         entry.last_access = clock;
-        Some(entry.slot)
+        Some(entry.place)
+    }
+
+    pub fn set_place(&mut self, hash: BlockHash, place: Place) {
+        if let Some(entry) = self.entries.get_mut(&hash) {
+            entry.place = place;
+        }
     }
 
     pub fn set_priority(&mut self, hash: BlockHash, priority: f64) {
@@ -208,12 +243,16 @@ impl Index {
         matched
     }
 
-    /// Unpinned resident leaves: the only blocks eligible for eviction.
+    /// Unpinned leaves: the only blocks that may be removed outright.
     pub fn leaves(&self) -> impl Iterator<Item = (BlockHash, &Entry)> {
         self.entries
             .iter()
             .filter(|(_, e)| e.children == 0 && e.pins == 0)
             .map(|(h, e)| (*h, e))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (BlockHash, &Entry)> {
+        self.entries.iter().map(|(h, e)| (*h, e))
     }
 }
 
@@ -228,8 +267,8 @@ mod tests {
     use super::*;
     use crate::block::{BlockLayout, PrefixHasher, TokenId};
 
-    fn slot(n: u32) -> SlotId {
-        SlotId::for_tests(n)
+    fn slot(n: u32) -> Place {
+        Place::Ram(SlotId::for_tests(n))
     }
 
     fn chain(n: usize) -> Vec<BlockHash> {
