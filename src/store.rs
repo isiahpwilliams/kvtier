@@ -283,14 +283,11 @@ impl KvStore {
             return Err(Admit::OutOfSpace);
         };
 
-        // Always admit once a victim exists, even when the newcomer models as
-        // cheaper. Refusing on that basis ossifies the cache: a new block
-        // starts shallow, so it always loses to the deep tails already
-        // resident, and nothing new is ever admitted -- which also means
-        // nothing is ever evicted, so the inflation clock never rises to
-        // break the tie. Letting it in at `L + cost` is what keeps the clock
-        // moving, and a block that is never used again leaves on the next
-        // pass anyway.
+        // Always admit once a victim exists, even when the newcomer models
+        // as cheaper. Refusing on cost ossifies the cache: new blocks start
+        // shallow and lose to the deep tails already resident, so nothing is
+        // admitted, nothing evicted, and the clock never rises to break the
+        // tie.
         self.evict(victim, priority);
         Ok(())
     }

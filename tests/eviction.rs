@@ -133,10 +133,8 @@ fn a_blocks_own_parent_is_never_the_victim() {
 
 #[test]
 fn a_cheap_newcomer_can_still_displace_an_expensive_resident() {
-    // Refusing on cost alone would ossify the cache: every new block starts
-    // shallow, so it would always lose to the deep tails already resident,
-    // nothing would be admitted, nothing evicted, and the inflation clock
-    // that breaks the tie would never rise. So the newcomer gets in.
+    // Refusing on cost alone would ossify the cache: new blocks start shallow
+    // and would always lose to the deep tails already resident.
     let mut store = new_store(2);
     admit_leaf(&mut store, 1, 120_000);
     admit_leaf(&mut store, 2, 120_000);

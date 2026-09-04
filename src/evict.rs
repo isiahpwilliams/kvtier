@@ -1,16 +1,14 @@
 //! Eviction policy: which block to give up when the slab is full.
 //!
-//! LRU is the wrong default here because blocks are not equally expensive to
-//! replace. The policy is GreedyDual-Size (Cao & Irani, 1997) with uniform
-//! size, which combines recency and cost in one number:
+//! GreedyDual-Size (Cao & Irani, 1997) with uniform size, which puts recency
+//! and recompute cost in one number:
 //!
 //!   on access:  H(b) = L + cost(b)
 //!   on evict:   pick min H, then set L = H(victim)
 //!
-//! `L` is a monotone inflation clock. A block touched recently carries a high
-//! `H`; one that has sat since `L` was low carries a stale low `H` and goes
-//! first. Cost tilts that ordering toward keeping what is expensive to
-//! rebuild.
+//! `L` is a monotone waterline. Touching a block lifts it clear; an untouched
+//! one keeps its score while the water rises around it. Cost decides how high
+//! above the line a block starts.
 
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
@@ -18,18 +16,13 @@ use std::collections::BinaryHeap;
 use crate::block::BlockHash;
 use crate::index::Index;
 
-/// What it costs to recompute one block, given its prefix is still cached.
+/// What it costs to recompute one block, given its prefix is still cached,
+/// in units where a block at depth zero costs 1.
 ///
-/// Two terms, in units where a block at depth zero costs 1:
-///
-///   * the linear layers, which cost the same at any depth
-///   * attention, which is proportional to how many tokens precede the block
-///
-/// They are equal at `attention_crossover_tokens`. For a Llama-3-8B-shaped
-/// model that is around 30k tokens: 2*P FLOPs per token for the linear terms
-/// against 4*D*d_model*layers for attention. So the spread across realistic
-/// depths is roughly 1x to 5x -- real, but nothing like the 400x you get if
-/// you assume attention dominates everywhere.
+/// The linear layers cost the same at any depth; attention is proportional to
+/// it. They are equal at `attention_crossover_tokens` -- about 30k for a
+/// Llama-3-8B shape -- so the spread across realistic depths is only 1x to 5x,
+/// and cost modifies recency rather than dominating it.
 #[derive(Clone, Copy, Debug)]
 pub struct CostModel {
     pub attention_crossover_tokens: f64,
@@ -52,9 +45,8 @@ impl Default for CostModel {
     }
 }
 
-/// Heap entry. Priorities are positive and finite, and for those the IEEE bit
-/// pattern orders exactly like the float, so we can sort on `u64` and keep
-/// `Ord` without pulling in a wrapper type.
+/// Heap entry. Positive finite floats order the same as their IEEE bit
+/// patterns, so sorting on `u64` gives `Ord` without a wrapper type.
 #[derive(PartialEq, Eq, PartialOrd, Ord)]
 struct Candidate {
     key: u64,
@@ -97,7 +89,6 @@ impl GreedyDual {
         self.inflation + self.cost.recompute_cost(depth_tokens)
     }
 
-    /// Offer a block as an eviction candidate at the given priority.
     pub fn offer(&mut self, hash: BlockHash, priority: f64) {
         self.heap.push(Reverse(Candidate {
             key: key(priority),
@@ -107,9 +98,9 @@ impl GreedyDual {
 
     /// The cheapest block worth giving up, or `None` if nothing is eligible.
     ///
-    /// `protect` is the block the caller is about to attach a child to.
-    /// Without it the parent -- a leaf until its child lands -- is usually the
-    /// most attractive victim, and admitting would orphan its own block.
+    /// `protect` is the parent the caller is about to attach a child to: a
+    /// leaf until that child lands, so otherwise the likeliest victim, and
+    /// taking it would orphan the incoming block.
     pub fn select_victim(
         &mut self,
         index: &Index,
@@ -140,7 +131,6 @@ impl GreedyDual {
         victim
     }
 
-    /// Record that `priority` was the cost of the block we gave up.
     pub fn note_eviction(&mut self, priority: f64) {
         debug_assert!(
             priority >= self.inflation,
