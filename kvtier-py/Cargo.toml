@@ -1,0 +1,13 @@
+[package]
+name = "kvtier-py"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kvtier"
+crate-type = ["cdylib"]
+
+[dependencies]
+kvtier = { path = ".." }
+pyo3 = { version = "0.28", features = ["extension-module"] }
+tokio = { version = "1", features = ["rt-multi-thread"] }
