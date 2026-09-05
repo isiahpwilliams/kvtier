@@ -9,10 +9,35 @@ The point is that prefill is expensive and redundant. Two requests sharing a
 4k-token system prompt compute byte-identical KV for those tokens, on every
 replica, every time. A shared tier means it gets computed once.
 
-## Status
+## What it does, and what it is worth
 
-Working: single-node store, binary wire protocol, cost-aware eviction, a RAM
-to NVMe tier, and a vLLM connector. TTFT is measured.
+A block is 16 tokens of KV named by its whole token history, so two sequences
+share a name exactly when their KV bytes are identical. Blocks live in RAM,
+spill to NVMe, and are served over a binary protocol to a vLLM connector that
+reads them straight into the engine's paged buffer.
+
+On Qwen2.5-7B and one A100, against vLLM with its own prefix caching on:
+
+- a **warm** tier cuts median time to first token **36.6%** when the GPU cache
+  holds 18% of the working set, and 14% when it holds most of it
+- a **second engine** reuses KV it never computed: a first request on an unseen
+  prefix costs **69 ms against 158 ms** with no tier
+- fetching beats recomputing above a **350-400 token** prefix, by about 2x
+
+And what it costs, which matters as much: a **cold** tier is 31% *slower* than
+no tier when the GPU cache is already big enough, because it pays to store
+blocks before anything comes back for them. Once a single engine's own cache
+covers its workload, the tier is overhead. It earns its place on a replica
+that has just started, a working set larger than GPU memory, or traffic that
+moves between replicas.
+
+### Not measured
+
+Single node, single GPU, tensor parallel degree 1, one model, one trace shape.
+Every benchmark here ran with the tier larger than the working set, so nothing
+was ever evicted and the cost-aware eviction policy and the NVMe tier have
+never been exercised by real KV. The connector handles one full-attention KV
+group and refuses hybrid and MLA models rather than degrading.
 
 ### Time to first token
 
@@ -274,6 +299,7 @@ for telling "the tier moved KV" apart from "a connector was present".
 ```bash
 .venv/bin/python python/test_layout.py        # KV layout translation
 .venv/bin/python python/test_connector.py     # tier KV == reused KV, end to end
+.venv/bin/python python/test_replicas.py      # a second engine reuses the first's KV
 .venv/bin/python python/run_ttft.py           # TTFT, all arms, cache sweep
 .venv/bin/python python/report_ttft.py bench_results
 .venv/bin/python python/bench_transfer.py --layers 28 --kv-heads 4 --head-dim 128
