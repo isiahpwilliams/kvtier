@@ -12,8 +12,9 @@
 
 use std::net::SocketAddr;
 
-use ::kvtier::block::{BlockHash, BlockLayout, DType, PrefixHasher, TokenId};
+use ::kvtier::block::{BlockHash, BlockLayout, BlockOrder, DType, PrefixHasher, Shard, TokenId};
 use ::kvtier::client::KvClient;
+use pyo3::buffer::PyBuffer;
 use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
@@ -27,6 +28,15 @@ fn parse_hash(bytes: &[u8]) -> PyResult<BlockHash> {
         .try_into()
         .map_err(|_| PyValueError::new_err("a block name is exactly 16 bytes"))?;
     Ok(BlockHash::from_bytes(bytes))
+}
+
+fn parse_shard(rank: u32, count: u32) -> PyResult<Shard> {
+    if count == 0 || rank >= count {
+        return Err(PyValueError::new_err(format!(
+            "tp_rank {rank} is not a rank of {count}"
+        )));
+    }
+    Ok(Shard { rank, count })
 }
 
 fn parse_dtype(name: &str) -> PyResult<DType> {
@@ -47,12 +57,22 @@ fn parse_dtype(name: &str) -> PyResult<DType> {
 struct Hasher {
     inner: PrefixHasher,
     layout: BlockLayout,
+    shard: Shard,
 }
 
 #[pymethods]
 impl Hasher {
     #[new]
-    #[pyo3(signature = (model_id, tokens_per_block, num_layers, num_kv_heads, head_dim, dtype))]
+    #[pyo3(signature = (
+        model_id,
+        tokens_per_block,
+        num_layers,
+        num_kv_heads,
+        head_dim,
+        dtype,
+        tp_rank = 0,
+        tp_size = 1,
+    ))]
     fn new(
         model_id: &str,
         tokens_per_block: usize,
@@ -60,6 +80,8 @@ impl Hasher {
         num_kv_heads: usize,
         head_dim: usize,
         dtype: &str,
+        tp_rank: u32,
+        tp_size: u32,
     ) -> PyResult<Self> {
         let layout = BlockLayout {
             tokens_per_block,
@@ -68,10 +90,29 @@ impl Hasher {
             head_dim,
             dtype: parse_dtype(dtype)?,
         };
+        let shard = parse_shard(tp_rank, tp_size)?;
         Ok(Self {
-            inner: PrefixHasher::new(model_id, &layout),
+            inner: PrefixHasher::sharded(model_id, &layout, BlockOrder::default(), shard),
             layout,
+            shard,
         })
+    }
+
+    /// The serialization order this namespace is built on. A connector that
+    /// lays bytes out differently must not share it.
+    #[getter]
+    fn order_tag(&self) -> &'static str {
+        BlockOrder::default().tag()
+    }
+
+    #[getter]
+    fn tp_rank(&self) -> u32 {
+        self.shard.rank
+    }
+
+    #[getter]
+    fn tp_size(&self) -> u32 {
+        self.shard.count
     }
 
     #[getter]
@@ -139,12 +180,20 @@ impl Client {
 
     /// A `Hasher` agreeing with this server's model and layout, so names
     /// computed here are the names it stores under.
-    fn hasher(&self) -> Hasher {
+    #[pyo3(signature = (tp_rank = 0, tp_size = 1))]
+    fn hasher(&self, tp_rank: u32, tp_size: u32) -> PyResult<Hasher> {
         let layout = self.client.info().layout.clone();
-        Hasher {
-            inner: PrefixHasher::new(&self.client.info().model_id, &layout),
+        let shard = parse_shard(tp_rank, tp_size)?;
+        Ok(Hasher {
+            inner: PrefixHasher::sharded(
+                &self.client.info().model_id,
+                &layout,
+                BlockOrder::default(),
+                shard,
+            ),
             layout,
-        }
+            shard,
+        })
     }
 
     /// How many leading blocks the server holds. Moves no KV.
@@ -183,6 +232,96 @@ impl Client {
             .into_iter()
             .map(|block| PyBytes::new(py, &block))
             .collect())
+    }
+
+    /// Fetch the resident leading run straight into `buffer`, returning how
+    /// many blocks landed.
+    ///
+    /// `get_blocks` costs a Vec per block, a `bytes` per block, and a join;
+    /// this writes once, into memory the caller can have page-locked so the
+    /// GPU DMAs out of it.
+    fn fetch_into(
+        &mut self,
+        py: Python<'_>,
+        hashes: Vec<Vec<u8>>,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<usize> {
+        let hashes = hashes
+            .iter()
+            .map(|bytes| parse_hash(bytes))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let view = PyBuffer::<u8>::get(buffer)?;
+        if view.readonly() {
+            return Err(PyValueError::new_err("fetch_into needs a writable buffer"));
+        }
+        if !view.is_c_contiguous() {
+            return Err(PyValueError::new_err(
+                "fetch_into needs a contiguous buffer",
+            ));
+        }
+        let block_bytes = self.client.block_bytes();
+        if view.item_count() < hashes.len() * block_bytes {
+            return Err(PyValueError::new_err(format!(
+                "buffer holds {} B, {} blocks need {} B",
+                view.item_count(),
+                hashes.len(),
+                hashes.len() * block_bytes
+            )));
+        }
+
+        // Safety: the buffer is writable, contiguous and u8, and the GIL is
+        // held for as long as this slice exists.
+        let out =
+            unsafe { std::slice::from_raw_parts_mut(view.buf_ptr() as *mut u8, view.item_count()) };
+
+        let client = &mut self.client;
+        py.detach(|| self.runtime.block_on(client.get_blocks_into(&hashes, out)))
+            .map_err(io_error)
+    }
+
+    /// Offer blocks read directly out of `buffer`, with no copy into Python.
+    #[pyo3(signature = (parent, names, buffer))]
+    fn put_from(
+        &mut self,
+        py: Python<'_>,
+        parent: Option<Vec<u8>>,
+        names: Vec<(Vec<u8>, u32)>,
+        buffer: &Bound<'_, PyAny>,
+    ) -> PyResult<(usize, usize, usize)> {
+        let parent = parent.as_deref().map(parse_hash).transpose()?;
+        let names = names
+            .iter()
+            .map(|(bytes, depth)| Ok((parse_hash(bytes)?, *depth)))
+            .collect::<PyResult<Vec<_>>>()?;
+
+        let view = PyBuffer::<u8>::get(buffer)?;
+        if !view.is_c_contiguous() {
+            return Err(PyValueError::new_err("put_from needs a contiguous buffer"));
+        }
+        let block_bytes = self.client.block_bytes();
+        let needed = names.len() * block_bytes;
+        if view.item_count() < needed {
+            return Err(PyValueError::new_err(format!(
+                "buffer holds {} B, {} blocks need {needed} B",
+                view.item_count(),
+                names.len()
+            )));
+        }
+
+        // Safety: contiguous u8, read only, GIL held for the slice's life.
+        let bytes = unsafe { std::slice::from_raw_parts(view.buf_ptr() as *const u8, needed) };
+        let payloads: Vec<&[u8]> = bytes.chunks_exact(block_bytes).collect();
+
+        let client = &mut self.client;
+        let report = py
+            .detach(|| {
+                self.runtime
+                    .block_on(client.put_blocks(parent, &names, &payloads))
+            })
+            .map_err(io_error)?;
+
+        Ok((report.inserted, report.deduped, report.dropped))
     }
 
     /// Offer blocks to the server. `names` pairs each block's name with the

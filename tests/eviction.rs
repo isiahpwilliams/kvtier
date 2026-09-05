@@ -73,6 +73,32 @@ fn the_cheapest_block_to_rebuild_goes_first() {
 }
 
 #[test]
+fn equal_priorities_evict_the_least_recently_used() {
+    // Same depth means the same recompute cost, so `L + cost` is one number
+    // for the whole slab and the policy has nothing left to order by. The
+    // tiebreak has to be recency; anything else can evict the hottest block.
+    let mut store = new_store(4);
+    let blocks: Vec<BlockHash> = (0..4).map(|s| admit_leaf(&mut store, s, 16)).collect();
+
+    // Touch three of them, leaving blocks[1] the coldest.
+    for &hash in [blocks[2], blocks[0], blocks[3]].iter() {
+        assert_eq!(store.match_prefix(&[hash]), 1);
+    }
+
+    admit_leaf(&mut store, 99, 16);
+
+    assert!(
+        store.read(blocks[1]).is_none(),
+        "the coldest block should go"
+    );
+    for (i, &hash) in blocks.iter().enumerate() {
+        if i != 1 {
+            assert!(store.read(hash).is_some(), "block {i} was touched, keep it");
+        }
+    }
+}
+
+#[test]
 fn a_block_that_keeps_getting_used_is_never_evicted() {
     let mut store = new_store(8);
     let kept = admit_leaf(&mut store, 999, 16);

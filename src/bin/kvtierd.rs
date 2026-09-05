@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use kvtier::block::BlockLayout;
+use kvtier::block::{BlockLayout, DType};
 use kvtier::server::Server;
 use kvtier::store::KvStore;
 use kvtier::tier::DiskTier;
@@ -25,8 +25,26 @@ async fn main() -> std::io::Result<()> {
     let layout = match env_or("KVTIER_LAYOUT", "llama3-8b".to_string()).as_str() {
         "tiny" => BlockLayout::tiny(),
         "llama3-8b" => BlockLayout::llama3_8b(),
+        // A real model is neither of the above, and its layout has to match
+        // the engine's exactly or the connect handshake refuses the client.
+        "custom" => BlockLayout {
+            tokens_per_block: env_or("KVTIER_TOKENS_PER_BLOCK", 16),
+            num_layers: env_or("KVTIER_LAYERS", 32),
+            num_kv_heads: env_or("KVTIER_KV_HEADS", 8),
+            head_dim: env_or("KVTIER_HEAD_DIM", 128),
+            dtype: match env_or("KVTIER_DTYPE", "f16".to_string()).as_str() {
+                "f32" => DType::F32,
+                "f16" => DType::F16,
+                "bf16" => DType::BF16,
+                "f8" => DType::F8,
+                other => {
+                    eprintln!("unknown KVTIER_DTYPE {other:?}");
+                    std::process::exit(2);
+                }
+            },
+        },
         other => {
-            eprintln!("unknown KVTIER_LAYOUT {other:?}; expected tiny or llama3-8b");
+            eprintln!("unknown KVTIER_LAYOUT {other:?}; expected tiny, llama3-8b or custom");
             std::process::exit(2);
         }
     };
